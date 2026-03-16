@@ -6,6 +6,7 @@ pub const pty = @import("pty.zig");
 pub const vt = @import("vt.zig");
 pub const scrollback = @import("scrollback.zig");
 pub const mode = @import("mode.zig");
+pub const input = @import("input.zig");
 
 pub fn main() !void {
     std.debug.print("zlice v0.1.0\n", .{});
@@ -18,4 +19,5 @@ test {
     _ = vt;
     _ = scrollback;
     _ = mode;
+    _ = input;
 }
