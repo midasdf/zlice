@@ -19,13 +19,39 @@ pub const Config = struct {
     // [session]
     socket_dir: []const u8 = "/tmp/zlice-{uid}",
     auto_save_layout: bool = true,
+
+    /// Allocator used for string fields. null when using compile-time defaults only.
+    _allocator: ?std.mem.Allocator = null,
+    /// Tracks all allocated strings for bulk free.
+    _allocs: ?std.ArrayListUnmanaged([]const u8) = null,
+
+    pub fn deinit(self: *Config) void {
+        if (self._allocator) |allocator| {
+            if (self._allocs) |allocs| {
+                for (allocs.items) |s| allocator.free(s);
+                var a = allocs;
+                a.deinit(allocator);
+            }
+        }
+    }
 };
 
+fn dupeAndTrack(cfg: *Config, allocator: std.mem.Allocator, str_val: []const u8) ![]const u8 {
+    const duped = try allocator.dupe(u8, str_val);
+    try cfg._allocs.?.append(allocator, duped);
+    return duped;
+}
+
 /// Parse a minimal TOML subset into a Config.
-/// String fields that are overridden by the file are allocated with `allocator`.
-/// Callers must free those strings. Default string literals are not heap-allocated.
+/// All heap-allocated string fields are owned by the Config's internal arena.
+/// Call cfg.deinit() to free all allocated memory at once.
 pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
-    var cfg = Config{};
+    var allocs = std.ArrayListUnmanaged([]const u8){};
+    errdefer {
+        for (allocs.items) |s| allocator.free(s);
+        allocs.deinit(allocator);
+    }
+    var cfg = Config{ ._allocator = allocator, ._allocs = allocs };
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |raw_line| {
@@ -66,23 +92,23 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
             const str_val = val[1..close];
 
             if (std.mem.eql(u8, key, "default_shell")) {
-                cfg.default_shell = try allocator.dupe(u8, str_val);
+                cfg.default_shell = try dupeAndTrack(&cfg, allocator, str_val);
             } else if (std.mem.eql(u8, key, "pane_mode_key")) {
-                cfg.pane_mode_key = try allocator.dupe(u8, str_val);
+                cfg.pane_mode_key = try dupeAndTrack(&cfg, allocator, str_val);
             } else if (std.mem.eql(u8, key, "tab_mode_key")) {
-                cfg.tab_mode_key = try allocator.dupe(u8, str_val);
+                cfg.tab_mode_key = try dupeAndTrack(&cfg, allocator, str_val);
             } else if (std.mem.eql(u8, key, "scroll_mode_key")) {
-                cfg.scroll_mode_key = try allocator.dupe(u8, str_val);
+                cfg.scroll_mode_key = try dupeAndTrack(&cfg, allocator, str_val);
             } else if (std.mem.eql(u8, key, "session_mode_key")) {
-                cfg.session_mode_key = try allocator.dupe(u8, str_val);
+                cfg.session_mode_key = try dupeAndTrack(&cfg, allocator, str_val);
             } else if (std.mem.eql(u8, key, "lock_mode_key")) {
-                cfg.lock_mode_key = try allocator.dupe(u8, str_val);
+                cfg.lock_mode_key = try dupeAndTrack(&cfg, allocator, str_val);
             } else if (std.mem.eql(u8, key, "status_bar_position")) {
-                cfg.status_bar_position = try allocator.dupe(u8, str_val);
+                cfg.status_bar_position = try dupeAndTrack(&cfg, allocator, str_val);
             } else if (std.mem.eql(u8, key, "pane_border_style")) {
-                cfg.pane_border_style = try allocator.dupe(u8, str_val);
+                cfg.pane_border_style = try dupeAndTrack(&cfg, allocator, str_val);
             } else if (std.mem.eql(u8, key, "socket_dir")) {
-                cfg.socket_dir = try allocator.dupe(u8, str_val);
+                cfg.socket_dir = try dupeAndTrack(&cfg, allocator, str_val);
             }
         } else if (std.mem.eql(u8, val, "true")) {
             if (std.mem.eql(u8, key, "status_bar")) {
@@ -115,7 +141,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
 /// Returns defaults if the file does not exist.
 /// All heap-allocated string fields must be freed by the caller.
 pub fn loadFromFile(allocator: std.mem.Allocator) !Config {
-    const home = std.posix.getenv("HOME") orelse "/root";
+    const home = std.posix.getenv("HOME") orelse return Config{};
     const path = try std.fmt.allocPrint(allocator, "{s}/.config/zlice/config.toml", .{home});
     defer allocator.free(path);
 
@@ -162,18 +188,8 @@ test "parse basic config" {
         \\auto_save_layout = false
     ;
 
-    const cfg = try parse(allocator, toml);
-
-    // Free all heap-allocated string fields
-    defer allocator.free(cfg.default_shell);
-    defer allocator.free(cfg.pane_mode_key);
-    defer allocator.free(cfg.tab_mode_key);
-    defer allocator.free(cfg.scroll_mode_key);
-    defer allocator.free(cfg.session_mode_key);
-    defer allocator.free(cfg.lock_mode_key);
-    defer allocator.free(cfg.status_bar_position);
-    defer allocator.free(cfg.pane_border_style);
-    defer allocator.free(cfg.socket_dir);
+    var cfg = try parse(allocator, toml);
+    defer cfg.deinit();
 
     try std.testing.expectEqualStrings("/bin/bash", cfg.default_shell);
     try std.testing.expectEqual(@as(u16, 2000), cfg.scrollback_lines);
@@ -194,8 +210,8 @@ test "parse basic config" {
 test "defaults when empty" {
     const allocator = std.testing.allocator;
 
-    const cfg = try parse(allocator, "");
-    // No heap allocations for default values — nothing to free.
+    var cfg = try parse(allocator, "");
+    defer cfg.deinit();
 
     try std.testing.expectEqualStrings("/bin/sh", cfg.default_shell);
     try std.testing.expectEqual(@as(u16, 1000), cfg.scrollback_lines);
@@ -229,8 +245,8 @@ test "comments and blank lines ignored" {
         \\status_bar = true  # inline comment
     ;
 
-    const cfg = try parse(allocator, toml);
-    defer allocator.free(cfg.default_shell);
+    var cfg = try parse(allocator, toml);
+    defer cfg.deinit();
 
     try std.testing.expectEqualStrings("/bin/zsh", cfg.default_shell);
     // scrollback_lines commented out — should remain default

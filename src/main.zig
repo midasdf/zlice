@@ -8,6 +8,7 @@ pub const scrollback = @import("scrollback.zig");
 pub const mode = @import("mode.zig");
 pub const input = @import("input.zig");
 pub const config = @import("config.zig");
+pub const pane = @import("pane.zig");
 
 pub fn main() !void {
     std.debug.print("zlice v0.1.0\n", .{});
@@ -22,4 +23,5 @@ test {
     _ = mode;
     _ = input;
     _ = config;
+    _ = pane;
 }
