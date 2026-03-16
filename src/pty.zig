@@ -53,7 +53,7 @@ pub const Pty = struct {
             posix.close(master_fd);
 
             // Create a new session so we can have a controlling terminal
-            _ = posix.setsid() catch {};
+            _ = linux.setsid();
 
             // Open slave PTY as controlling terminal
             const slave_fd = posix.openZ(slave_path.ptr, .{ .ACCMODE = .RDWR }, 0) catch {
@@ -77,8 +77,7 @@ pub const Pty = struct {
                 "TERM=xterm-256color",
             };
 
-            const err = posix.execveZ(shell, argv, envp);
-            _ = err;
+            posix.execveZ(shell, argv, envp) catch {};
             std.process.exit(1);
         }
 

@@ -149,7 +149,7 @@ pub fn run(socket_path: [:0]const u8) !void {
     var recv_buf: [RECV_BUF_SIZE]u8 = undefined;
     var recv_len: usize = 0;
 
-    const stdout = std.io.getStdOut();
+    const stdout = std.fs.File.stdout();
 
     // ── Event loop ────────────────────────────────────────────────────────────
     while (running) {
@@ -350,8 +350,9 @@ fn handleServerFrame(
         .err => {
             const err_info = protocol.decodeError(payload) catch return true;
             // Display the error message in the terminal (best effort).
-            const stderr = std.io.getStdErr();
-            stderr.writer().print("\r\n[zlice error {d}]: {s}\r\n", .{ err_info.code, err_info.msg }) catch {};
+            var err_buf: [256]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "\r\n[zlice error {d}]: {s}\r\n", .{ err_info.code, err_info.msg }) catch &err_buf;
+            _ = posix.write(posix.STDERR_FILENO, err_msg) catch {};
         },
 
         // Client-bound only; ignore if server mistakenly sends client→server types.

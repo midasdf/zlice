@@ -347,7 +347,7 @@ pub const Server = struct {
 
                 if (tag == TAG_LISTEN) {
                     // Accept a new client (single-client: close previous if any)
-                    const new_client = posix.accept(self.listen_fd, null, null) catch continue;
+                    const new_client = posix.accept(self.listen_fd, null, null, posix.SOCK.CLOEXEC) catch continue;
                     if (self.client_fd) |old| {
                         const r2 = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, old, null);
                         _ = r2;
@@ -787,7 +787,7 @@ pub const Server = struct {
 
         // Encode all dirty regions into a single render payload using escape sequences.
         // Format: for each region, emit CUP + cell SGR+char sequences.
-        var payload_list = std.ArrayList(u8).init(self.allocator);
+        var payload_list = std.array_list.Managed(u8).init(self.allocator);
         defer payload_list.deinit();
         const writer = payload_list.writer();
 
