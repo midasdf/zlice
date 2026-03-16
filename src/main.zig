@@ -9,6 +9,7 @@ pub const mode = @import("mode.zig");
 pub const input = @import("input.zig");
 pub const config = @import("config.zig");
 pub const pane = @import("pane.zig");
+pub const tab = @import("tab.zig");
 
 pub fn main() !void {
     std.debug.print("zlice v0.1.0\n", .{});
@@ -24,4 +25,5 @@ test {
     _ = input;
     _ = config;
     _ = pane;
+    _ = tab;
 }
