@@ -13,6 +13,7 @@ pub const tab = @import("tab.zig");
 pub const render = @import("render.zig");
 pub const status_bar = @import("status_bar.zig");
 pub const client = @import("client.zig");
+pub const server = @import("server.zig");
 
 pub fn main() !void {
     std.debug.print("zlice v0.1.0\n", .{});
@@ -32,4 +33,5 @@ test {
     _ = render;
     _ = status_bar;
     _ = client;
+    _ = server;
 }
