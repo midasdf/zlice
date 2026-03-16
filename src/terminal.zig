@@ -34,8 +34,9 @@ pub const RawMode = struct {
         raw.lflag.ISIG = false;
         raw.lflag.IEXTEN = false;
 
-        // cc: VMIN=0 VTIME=0 (non-blocking reads)
-        raw.cc[@intFromEnum(linux.V.MIN)] = 0;
+        // cc: VMIN=1 VTIME=0 (block until at least 1 byte available)
+        // Works with epoll: epoll only signals EPOLLIN when data is ready.
+        raw.cc[@intFromEnum(linux.V.MIN)] = 1;
         raw.cc[@intFromEnum(linux.V.TIME)] = 0;
 
         try posix.tcsetattr(fd, .NOW, raw);
