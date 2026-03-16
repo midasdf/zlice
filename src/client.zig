@@ -112,6 +112,7 @@ pub fn run(socket_path: [:0]const u8) !void {
 
     // ── Hello ─────────────────────────────────────────────────────────────────
     const term_size = terminal.getSize(posix.STDOUT_FILENO) catch terminal.TerminalSize{ .cols = 80, .rows = 24 };
+    debugLog("terminal size: {}x{}\n", .{ term_size.cols, term_size.rows });
     const term_env = std.posix.getenv("TERM") orelse "xterm-256color";
 
     var hello_payload: [256]u8 = undefined;

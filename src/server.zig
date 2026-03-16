@@ -452,6 +452,7 @@ pub const Server = struct {
                 self.client_cols = hp.cols;
                 self.client_rows = hp.rows;
                 self.screen.resize(hp.cols, hp.rows) catch {};
+                self.resizeAllPanes();
                 self.compose();
             },
             .input => {
@@ -771,6 +772,17 @@ pub const Server = struct {
                 const s = std.fmt.bufPrint(&default_title_buf, "Pane {d}", .{entry.id + 1}) catch "Pane";
                 break :blk s;
             };
+
+            // Debug: log sizes
+            {
+                const log_fd = std.posix.open("/tmp/zlice-server-debug.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch null;
+                if (log_fd) |fd| {
+                    defer std.posix.close(fd);
+                    var dbuf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&dbuf, "region: row={} col={} rows={} cols={} | pane: cols={} rows={} | screen: {}x{}\n", .{ region.row, region.col, region.rows, region.cols, pane_state.cols, pane_state.rows, self.screen.cols, self.screen.rows }) catch "";
+                    _ = std.posix.write(fd, msg) catch {};
+                }
+            }
 
             // Draw zellij-style border with title in top frame line
             self.screen.drawBorderWithTitle(region, title, is_active);
