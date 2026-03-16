@@ -371,6 +371,8 @@ pub const Server = struct {
                     recv_len = 0;
                     // Send hello_ack with empty payload
                     self.sendFrame(.hello_ack, &.{}) catch {};
+                    // Hide cursor and force full redraw
+                    self.sendFrame(.render, "\x1b[?25l") catch {};
 
                 } else if (tag == TAG_CLIENT) {
                     // Read from client

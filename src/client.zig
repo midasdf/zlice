@@ -83,6 +83,14 @@ pub fn run(socket_path: [:0]const u8) !void {
     var raw = try terminal.RawMode.enter(posix.STDIN_FILENO);
     defer raw.leave();
 
+    // ── Switch to alternate screen and clear ────────────────────────────────
+    const stdout_fd = posix.STDOUT_FILENO;
+    _ = posix.write(stdout_fd, "\x1b[?1049h\x1b[2J\x1b[H") catch {};
+    defer {
+        // Restore main screen on exit
+        _ = posix.write(stdout_fd, "\x1b[?1049l") catch {};
+    }
+
     // ── Hello ─────────────────────────────────────────────────────────────────
     const term_size = terminal.getSize(posix.STDOUT_FILENO) catch terminal.TerminalSize{ .cols = 80, .rows = 24 };
     const term_env = std.posix.getenv("TERM") orelse "xterm-256color";
