@@ -706,27 +706,35 @@ pub const Server = struct {
         const regions = active_tab.pane_tree.calculateRegions(total_region) catch return;
         defer self.allocator.free(regions);
 
-        // For each pane region, copy pane screen buffer into compositor back buffer
+        // For each pane region, draw border and copy pane content inset by 1
         for (regions) |entry| {
             const pane_state = self.pane_states.get(entry.id) orelse continue;
             const region = entry.region;
             const is_active = (entry.id == active_tab.pane_tree.active_pane);
 
+            // Draw border around pane region
+            self.screen.drawBorder(region, is_active);
+
+            // Content area is inset by 1 on each side for the border
+            const inner_row = region.row + 1;
+            const inner_col = region.col + 1;
+            const inner_rows = if (region.rows > 2) region.rows - 2 else 0;
+            const inner_cols = if (region.cols > 2) region.cols - 2 else 0;
+
             // Copy rows from pane screen into compositor screen
             var r: u16 = 0;
-            while (r < region.rows) : (r += 1) {
-                const pane_row = r;
-                if (pane_row >= pane_state.rows) break;
-                const screen_row = region.row + r;
+            while (r < inner_rows) : (r += 1) {
+                if (r >= pane_state.rows) break;
+                const screen_row = inner_row + r;
                 if (screen_row >= self.screen.rows) break;
 
                 var c: u16 = 0;
-                while (c < region.cols) : (c += 1) {
+                while (c < inner_cols) : (c += 1) {
                     if (c >= pane_state.cols) break;
-                    const screen_col = region.col + c;
+                    const screen_col = inner_col + c;
                     if (screen_col >= self.screen.cols) break;
 
-                    const pane_idx = @as(usize, pane_row) * pane_state.cols + c;
+                    const pane_idx = @as(usize, r) * pane_state.cols + c;
                     const vt_cell = pane_state.screen[pane_idx];
 
                     const screen_cell = self.screen.cellAt(screen_row, screen_col);
@@ -738,9 +746,6 @@ pub const Server = struct {
                     };
                 }
             }
-
-            // Draw border for this pane
-            self.screen.drawBorder(region, is_active);
         }
 
         // Render status bar in the bottom row if enabled
