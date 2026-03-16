@@ -11,6 +11,7 @@ pub const config = @import("config.zig");
 pub const pane = @import("pane.zig");
 pub const tab = @import("tab.zig");
 pub const render = @import("render.zig");
+pub const status_bar = @import("status_bar.zig");
 
 pub fn main() !void {
     std.debug.print("zlice v0.1.0\n", .{});
@@ -28,4 +29,5 @@ test {
     _ = pane;
     _ = tab;
     _ = render;
+    _ = status_bar;
 }
