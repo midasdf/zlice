@@ -78,10 +78,36 @@ pub const Pty = struct {
             // Close the slave fd if it's not one of the standard fds
             if (slave_fd > 2) posix.close(slave_fd);
 
-            // Build argv and envp for execve
+            // Build argv for execve
             const argv: [*:null]const ?[*:0]const u8 = &[_:null]?[*:0]const u8{shell};
+
+            // Build envp with essential variables from parent + TERM override
+            const home = posix.getenv("HOME") orelse "/";
+            const user = posix.getenv("USER") orelse "user";
+            const path = posix.getenv("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
+            const lang = posix.getenv("LANG") orelse "C.UTF-8";
+            const shell_env = posix.getenv("SHELL") orelse "/bin/sh";
+
+            var term_buf: [64]u8 = undefined;
+            const term_str = std.fmt.bufPrintZ(&term_buf, "TERM=xterm-256color", .{}) catch "TERM=xterm-256color";
+            var home_buf: [256]u8 = undefined;
+            const home_str = std.fmt.bufPrintZ(&home_buf, "HOME={s}", .{home}) catch "HOME=/";
+            var user_buf: [128]u8 = undefined;
+            const user_str = std.fmt.bufPrintZ(&user_buf, "USER={s}", .{user}) catch "USER=user";
+            var path_buf: [1024]u8 = undefined;
+            const path_str = std.fmt.bufPrintZ(&path_buf, "PATH={s}", .{path}) catch "PATH=/usr/bin:/bin";
+            var lang_buf: [64]u8 = undefined;
+            const lang_str = std.fmt.bufPrintZ(&lang_buf, "LANG={s}", .{lang}) catch "LANG=C.UTF-8";
+            var shell_buf: [256]u8 = undefined;
+            const shell_str = std.fmt.bufPrintZ(&shell_buf, "SHELL={s}", .{shell_env}) catch "SHELL=/bin/sh";
+
             const envp: [*:null]const ?[*:0]const u8 = &[_:null]?[*:0]const u8{
-                "TERM=xterm-256color",
+                term_str,
+                home_str,
+                user_str,
+                path_str,
+                lang_str,
+                shell_str,
             };
 
             posix.execveZ(shell, argv, envp) catch {};

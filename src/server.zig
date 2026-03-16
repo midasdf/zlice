@@ -624,7 +624,8 @@ pub const Server = struct {
     // ── spawnPaneState ────────────────────────────────────────────────────────
 
     pub fn spawnPaneState(self: *Server, pane_id: pane_mod.PaneId) !void {
-        const shell = self.config.default_shell;
+        // Use $SHELL if available, otherwise fall back to config default
+        const shell = std.posix.getenv("SHELL") orelse self.config.default_shell;
         const shell_z = try self.allocator.dupeZ(u8, shell);
         defer self.allocator.free(shell_z);
 
@@ -690,6 +691,15 @@ pub const Server = struct {
         var buf: [4096]u8 = undefined;
         const n = state.pty.read(&buf) catch return;
         if (n == 0) return;
+
+        // Debug: dump first PTY output
+        {
+            const log_fd = std.posix.open("/tmp/zlice-pty-dump.bin", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch null;
+            if (log_fd) |fd| {
+                defer std.posix.close(fd);
+                _ = std.posix.write(fd, buf[0..n]) catch {};
+            }
+        }
 
         // Feed bytes through VT parser and update pane screen buffer
         for (buf[0..n]) |byte| {
