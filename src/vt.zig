@@ -69,6 +69,7 @@ const State = enum {
     csi_param,
     csi_intermediate,
     osc_string,
+    dcs_passthrough, // Consume DCS sequences until ST
 };
 
 const MAX_PARAMS = 16;
@@ -86,6 +87,11 @@ pub const Parser = struct {
     // OSC accumulator
     osc_buf: [OSC_BUF_LEN]u8 = undefined,
     osc_len: usize = 0,
+
+    // UTF-8 multibyte accumulator
+    utf8_buf: [4]u8 = undefined,
+    utf8_len: u3 = 0,
+    utf8_expected: u3 = 0,
 
     pub fn init() Parser {
         return .{};
@@ -125,6 +131,41 @@ pub const Parser = struct {
                     '\t' => return .tab,
                     0x07 => return .bell,
                     0x20...0x7e => return .{ .print = byte },
+                    // UTF-8 multibyte start bytes
+                    0xc0...0xdf => {
+                        self.utf8_buf[0] = byte;
+                        self.utf8_len = 1;
+                        self.utf8_expected = 2;
+                        return null;
+                    },
+                    0xe0...0xef => {
+                        self.utf8_buf[0] = byte;
+                        self.utf8_len = 1;
+                        self.utf8_expected = 3;
+                        return null;
+                    },
+                    0xf0...0xf7 => {
+                        self.utf8_buf[0] = byte;
+                        self.utf8_len = 1;
+                        self.utf8_expected = 4;
+                        return null;
+                    },
+                    // UTF-8 continuation bytes (when accumulating)
+                    0x80...0xbf => {
+                        if (self.utf8_len > 0 and self.utf8_len < self.utf8_expected) {
+                            self.utf8_buf[self.utf8_len] = byte;
+                            self.utf8_len += 1;
+                            if (self.utf8_len == self.utf8_expected) {
+                                // Decode complete UTF-8 sequence
+                                const cp = decodeUtf8(self.utf8_buf[0..self.utf8_len]);
+                                self.utf8_len = 0;
+                                self.utf8_expected = 0;
+                                return if (cp) |c| .{ .print = c } else null;
+                            }
+                            return null;
+                        }
+                        return null; // stray continuation byte
+                    },
                     else => return null,
                 }
             },
@@ -145,6 +186,11 @@ pub const Parser = struct {
                     'M' => {
                         self.state = .ground;
                         return .{ .scroll_down = 1 };
+                    },
+                    'P' => {
+                        // DCS (Device Control String) — consume until ST
+                        self.state = .dcs_passthrough;
+                        return null;
                     },
                     0x20...0x2f => {
                         // intermediate bytes
@@ -265,6 +311,24 @@ pub const Parser = struct {
                         }
                         return null;
                     },
+                }
+            },
+
+            // ── DCS passthrough ──────────────────────────────────
+            // Consume all bytes until ST (ESC \) or BEL
+            .dcs_passthrough => {
+                switch (byte) {
+                    0x1b => {
+                        // ESC — next byte should be '\' for ST. Go to ground.
+                        self.state = .ground;
+                        return null;
+                    },
+                    0x07 => {
+                        // BEL also terminates
+                        self.state = .ground;
+                        return null;
+                    },
+                    else => return null, // consume silently
                 }
             },
         }
@@ -430,6 +494,26 @@ pub const Parser = struct {
     // ─────────────────────────────────────────────────────────
     // OSC dispatch
     // ─────────────────────────────────────────────────────────
+
+    fn decodeUtf8(bytes: []const u8) ?u21 {
+        if (bytes.len == 2) {
+            const c0: u21 = bytes[0] & 0x1f;
+            const c1: u21 = bytes[1] & 0x3f;
+            return (c0 << 6) | c1;
+        } else if (bytes.len == 3) {
+            const c0: u21 = bytes[0] & 0x0f;
+            const c1: u21 = bytes[1] & 0x3f;
+            const c2: u21 = bytes[2] & 0x3f;
+            return (c0 << 12) | (c1 << 6) | c2;
+        } else if (bytes.len == 4) {
+            const c0: u21 = bytes[0] & 0x07;
+            const c1: u21 = bytes[1] & 0x3f;
+            const c2: u21 = bytes[2] & 0x3f;
+            const c3: u21 = bytes[3] & 0x3f;
+            return (c0 << 18) | (c1 << 12) | (c2 << 6) | c3;
+        }
+        return null;
+    }
 
     fn dispatchOsc(self: *Parser) ?Event {
         const buf = self.osc_buf[0..self.osc_len];
