@@ -108,6 +108,8 @@ pub const Pty = struct {
                 path_str,
                 lang_str,
                 shell_str,
+                "TERM_PROGRAM=zlice",
+                "ZELLIJ=0", // Prevent zellij auto-start inside zlice
             };
 
             posix.execveZ(shell, argv, envp) catch {};
