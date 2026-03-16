@@ -58,6 +58,10 @@ pub const PaneState = struct {
     /// Pane title (set by OSC set_title VT sequence or defaulted to "Pane N").
     title: [64]u8 = [_]u8{0} ** 64,
     title_len: u8 = 0,
+    /// Current drawing pen (SGR state)
+    pen_fg: vt_mod.Color = .default,
+    pen_bg: vt_mod.Color = .default,
+    pen_attr: vt_mod.Attr = .{},
 
     /// Apply a VT event to this pane's screen buffer.
     pub fn applyEvent(self: *PaneState, ev: vt_mod.Event) void {
@@ -65,7 +69,12 @@ pub const PaneState = struct {
             .print => |ch| {
                 if (self.cursor_row >= self.rows or self.cursor_col >= self.cols) return;
                 const idx = @as(usize, self.cursor_row) * self.cols + self.cursor_col;
-                self.screen[idx].char = ch;
+                self.screen[idx] = .{
+                    .char = ch,
+                    .fg = self.pen_fg,
+                    .bg = self.pen_bg,
+                    .attr = self.pen_attr,
+                };
                 self.cursor_col += 1;
                 if (self.cursor_col >= self.cols) {
                     self.cursor_col = 0;
@@ -139,10 +148,24 @@ pub const PaneState = struct {
             .scroll_up => |n| self.scrollScreenUp(n),
             .scroll_down => |n| self.scrollScreenDown(n),
             .sgr => |params| {
-                // SGR updates are stored per-cell as cells are printed.
-                // We track a "current" attr/fg/bg but since PaneState doesn't
-                // carry a pen, we apply it at print time. For now, ignore.
-                _ = params;
+                if (params.reset) {
+                    self.pen_fg = .default;
+                    self.pen_bg = .default;
+                    self.pen_attr = .{};
+                }
+                if (params.fg) |fg| self.pen_fg = fg;
+                if (params.bg) |bg| self.pen_bg = bg;
+                if (params.attr) |attr| {
+                    // Merge attribute bits (SGR sets individual flags)
+                    if (attr.bold) self.pen_attr.bold = true;
+                    if (attr.dim) self.pen_attr.dim = true;
+                    if (attr.italic) self.pen_attr.italic = true;
+                    if (attr.underline) self.pen_attr.underline = true;
+                    if (attr.blink) self.pen_attr.blink = true;
+                    if (attr.inverse) self.pen_attr.inverse = true;
+                    if (attr.hidden) self.pen_attr.hidden = true;
+                    if (attr.strikethrough) self.pen_attr.strikethrough = true;
+                }
             },
             .set_title => |t| {
                 const len: u8 = @intCast(@min(t.len, self.title.len));
