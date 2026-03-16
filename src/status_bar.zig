@@ -108,7 +108,8 @@ pub fn renderStatusBar(
     active_tab: u8,
 ) void {
     // Fill entire row with background first.
-    for (cells[0..cols]) |*c| {
+    const safe_cols = @min(cols, @as(u16, @intCast(cells.len)));
+    for (cells[0..safe_cols]) |*c| {
         c.* = render.Cell{ .char = ' ', .fg = .default, .bg = BAR_BG };
     }
 

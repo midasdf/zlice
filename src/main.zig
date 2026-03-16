@@ -114,7 +114,8 @@ fn startNewSession(allocator: std.mem.Allocator, cfg: *const config.Config, name
     if (pid == 0) {
         // Child: exec self as server.
         // Detach from the parent's session/process group so it survives.
-        _ = linux.setsid();
+        const sid = linux.setsid();
+        if (@as(isize, @bitCast(sid)) == -1) std.process.exit(1);
 
         const argv = [_:null]?[*:0]const u8{
             self_exe_z.ptr,

@@ -53,7 +53,8 @@ pub const Pty = struct {
             posix.close(master_fd);
 
             // Create a new session so we can have a controlling terminal
-            _ = linux.setsid();
+            const sid = linux.setsid();
+            if (@as(isize, @bitCast(sid)) == -1) std.process.exit(1);
 
             // Open slave PTY as controlling terminal
             const slave_fd = posix.openZ(slave_path.ptr, .{ .ACCMODE = .RDWR }, 0) catch {

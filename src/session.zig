@@ -42,7 +42,14 @@ pub fn getDataDir(allocator: std.mem.Allocator) ![]const u8 {
 
 /// Build the full path for a session file.
 /// Caller owns the returned slice.
+/// Returns error.InvalidSessionName if name contains path separators or ".."
 fn getSessionPath(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    // Reject path traversal attempts
+    if (name.len == 0) return error.InvalidSessionName;
+    if (std.mem.indexOf(u8, name, "/") != null) return error.InvalidSessionName;
+    if (std.mem.indexOf(u8, name, "\\") != null) return error.InvalidSessionName;
+    if (std.mem.indexOf(u8, name, "..") != null) return error.InvalidSessionName;
+
     const dir = try getDataDir(allocator);
     defer allocator.free(dir);
     return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ dir, name });

@@ -164,13 +164,15 @@ pub const PaneState = struct {
         const move_rows = self.rows - rows_to_scroll;
         if (move_rows > 0) {
             // Move rows downward — must copy backwards to avoid overlap.
-            var dst_row = self.rows - 1;
-            while (dst_row >= rows_to_scroll) : (dst_row -= 1) {
-                const src_row = dst_row - rows_to_scroll;
-                const src = @as(usize, src_row) * self.cols;
-                const dst = @as(usize, dst_row) * self.cols;
+            // Use signed arithmetic to avoid unsigned underflow.
+            var dst_row_i: isize = @as(isize, self.rows) - 1;
+            const scroll_i: isize = @intCast(rows_to_scroll);
+            while (dst_row_i >= scroll_i) : (dst_row_i -= 1) {
+                const src_row: usize = @intCast(dst_row_i - scroll_i);
+                const dst_row: usize = @intCast(dst_row_i);
+                const src = src_row * self.cols;
+                const dst = dst_row * self.cols;
                 @memcpy(self.screen[dst .. dst + self.cols], self.screen[src .. src + self.cols]);
-                if (dst_row == 0) break;
             }
         }
         // Clear the vacated top rows
@@ -375,6 +377,8 @@ pub const Server = struct {
                     const cfd = self.client_fd orelse continue;
                     const space = recv_buf.len - recv_len;
                     if (space == 0) {
+                        // Buffer full with no complete frame — protocol error, disconnect
+                        self.disconnectClient();
                         recv_len = 0;
                         continue;
                     }

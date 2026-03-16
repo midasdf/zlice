@@ -10,6 +10,21 @@ pub const InputParser = struct {
     state: State = .ground,
     buf: [8]u8 = undefined,
     buf_len: u8 = 0,
+    /// Tracks the raw bytes that produced the last emitted Key.
+    seq_buf: [16]u8 = undefined,
+    seq_len: u8 = 0,
+
+    fn trackByte(self: *InputParser, byte: u8) void {
+        if (self.seq_len < self.seq_buf.len) {
+            self.seq_buf[self.seq_len] = byte;
+            self.seq_len += 1;
+        }
+    }
+
+    /// Returns the raw bytes that produced the last emitted Key.
+    pub fn lastSequence(self: *const InputParser) []const u8 {
+        return self.seq_buf[0..self.seq_len];
+    }
 
     /// Feed one raw byte. Returns a Key if one can be emitted now.
     pub fn feed(self: *InputParser, byte: u8) ?Key {
@@ -17,26 +32,28 @@ pub const InputParser = struct {
             .ground => {
                 if (byte == 0x1b) {
                     self.state = .escape;
+                    self.seq_len = 0;
+                    self.trackByte(byte);
                     return null;
                 }
+                self.seq_len = 0;
+                self.trackByte(byte);
                 return mapByte(byte);
             },
 
             .escape => {
+                self.trackByte(byte);
                 if (byte == '[') {
                     self.state = .csi;
                     self.buf_len = 0;
                     return null;
                 }
-                // Any other byte after ESC: transition back to ground and
-                // emit bare .escape. The triggering byte is dropped here;
-                // callers that need it can re-feed it from ground state.
                 self.state = .ground;
                 return .escape;
             },
 
             .csi => {
-                // Accumulate parameter bytes (digits and ';')
+                self.trackByte(byte);
                 if ((byte >= '0' and byte <= '9') or byte == ';') {
                     if (self.buf_len < self.buf.len) {
                         self.buf[self.buf_len] = byte;
@@ -44,12 +61,10 @@ pub const InputParser = struct {
                     }
                     return null;
                 }
-                // Final byte range 0x40-0x7e
                 if (byte >= 0x40 and byte <= 0x7e) {
                     self.state = .ground;
                     return mapCsi(byte, self.buf[0..self.buf_len]);
                 }
-                // Unexpected byte — abort CSI sequence
                 self.state = .ground;
                 return .other;
             },
@@ -60,6 +75,7 @@ pub const InputParser = struct {
     pub fn flush(self: *InputParser) ?Key {
         if (self.state == .escape) {
             self.state = .ground;
+            // seq_buf already has 0x1b from the initial ESC
             return .escape;
         }
         return null;

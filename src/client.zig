@@ -256,15 +256,13 @@ fn handleStdinBytes(
         const maybe_key = input_parser.feed(byte);
         const key = maybe_key orelse continue;
 
-        // In locked mode every key (including the unlock sequence) is routed
-        // through ModeState.  In other modes, only recognised Keys are.
         const action = mode_state.handleKey(key);
-        try dispatchAction(action, &.{byte}, sock_fd);
+        try dispatchAction(action, input_parser.lastSequence(), sock_fd);
     }
     // Flush any pending ESC that wasn't followed by '['
     if (input_parser.flush()) |key| {
         const action = mode_state.handleKey(key);
-        try dispatchAction(action, &.{0x1b}, sock_fd);
+        try dispatchAction(action, input_parser.lastSequence(), sock_fd);
     }
 }
 
