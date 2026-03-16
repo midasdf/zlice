@@ -476,6 +476,13 @@ pub const Server = struct {
                 self.resizeAllPanes();
                 self.compose();
             },
+            .state => {
+                // Client mode changed — update server-side mode for status bar
+                if (payload.len >= 1) {
+                    self.current_mode = std.meta.intToEnum(mode_mod.Mode, payload[0]) catch .normal;
+                    self.compose();
+                }
+            },
             else => {},
         }
     }
@@ -620,9 +627,10 @@ pub const Server = struct {
         const shell_z = try self.allocator.dupeZ(u8, shell);
         defer self.allocator.free(shell_z);
 
-        const pty = try pty_mod.Pty.spawn(shell_z, self.client_cols, self.client_rows);
+        const inner = self.innerPaneSize();
+        const pty = try pty_mod.Pty.spawn(shell_z, inner.cols, inner.rows);
 
-        const screen_len = @as(usize, self.client_cols) * @as(usize, self.client_rows);
+        const screen_len = @as(usize, inner.cols) * @as(usize, inner.rows);
         const screen = try self.allocator.alloc(vt_mod.Cell, screen_len);
         errdefer self.allocator.free(screen);
         @memset(screen, vt_mod.Cell{});
@@ -638,8 +646,8 @@ pub const Server = struct {
             .vt_parser = vt_mod.Parser.init(),
             .scrollback = sb,
             .screen = screen,
-            .cols = self.client_cols,
-            .rows = self.client_rows,
+            .cols = inner.cols,
+            .rows = inner.rows,
         };
 
         try self.pane_states.put(pane_id, state);
@@ -897,21 +905,31 @@ pub const Server = struct {
 
     // ── resizeAllPanes ────────────────────────────────────────────────────────
 
+    /// Compute the inner content size for a single pane (frame border inset + tab/status bar).
+    fn innerPaneSize(self: *Server) struct { cols: u16, rows: u16 } {
+        // 2 rows reserved (tab bar top + status bar bottom) + 2 for border top/bottom
+        const reserved_rows: u16 = 2 + 2;
+        // 2 cols for border left/right
+        const reserved_cols: u16 = 2;
+        return .{
+            .cols = if (self.client_cols > reserved_cols) self.client_cols - reserved_cols else 1,
+            .rows = if (self.client_rows > reserved_rows) self.client_rows - reserved_rows else 1,
+        };
+    }
+
     fn resizeAllPanes(self: *Server) void {
-        // Simple resize: give all panes the full client dims (they'll be
-        // bounded by their region at compose time, but PTY needs a size).
+        const inner = self.innerPaneSize();
         var it = self.pane_states.iterator();
         while (it.next()) |entry| {
             const state = entry.value_ptr.*;
-            state.pty.setSize(self.client_cols, self.client_rows) catch {};
-            // Reallocate screen buffer if dimensions changed
-            const new_len = @as(usize, self.client_cols) * @as(usize, self.client_rows);
-            if (state.cols != self.client_cols or state.rows != self.client_rows) {
+            state.pty.setSize(inner.cols, inner.rows) catch {};
+            const new_len = @as(usize, inner.cols) * @as(usize, inner.rows);
+            if (state.cols != inner.cols or state.rows != inner.rows) {
                 const new_screen = self.allocator.alloc(vt_mod.Cell, new_len) catch continue;
                 self.allocator.free(state.screen);
                 state.screen = new_screen;
-                state.cols = self.client_cols;
-                state.rows = self.client_rows;
+                state.cols = inner.cols;
+                state.rows = inner.rows;
                 @memset(state.screen, vt_mod.Cell{});
                 state.cursor_row = 0;
                 state.cursor_col = 0;

@@ -332,9 +332,10 @@ fn dispatchAction(
             };
             try sendFrame(sock_fd, .command, &payload);
         },
-        .switch_mode => {
-            // Mode transitions are handled locally by ModeState; nothing to
-            // send over the wire for now.
+        .switch_mode => |new_mode| {
+            // Notify server so it can update the status bar display
+            const payload = [_]u8{@intFromEnum(new_mode)};
+            try sendFrame(sock_fd, .state, &payload);
         },
         .start_rename_tab => {
             // Tab rename requires interactive input — not yet implemented.
