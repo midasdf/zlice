@@ -55,6 +55,9 @@ pub const PaneState = struct {
     cols: u16,
     rows: u16,
     scroll_offset: u16 = 0, // lines scrolled back from live view
+    /// Pane title (set by OSC set_title VT sequence or defaulted to "Pane N").
+    title: [64]u8 = [_]u8{0} ** 64,
+    title_len: u8 = 0,
 
     /// Apply a VT event to this pane's screen buffer.
     pub fn applyEvent(self: *PaneState, ev: vt_mod.Event) void {
@@ -141,7 +144,12 @@ pub const PaneState = struct {
                 // carry a pen, we apply it at print time. For now, ignore.
                 _ = params;
             },
-            else => {}, // bell, tab, set_title, alt_screen, cursor_visible, scroll_region etc.
+            .set_title => |t| {
+                const len: u8 = @intCast(@min(t.len, self.title.len));
+                @memcpy(self.title[0..len], t[0..len]);
+                self.title_len = len;
+            },
+            else => {}, // bell, tab, alt_screen, cursor_visible, scroll_region etc.
         }
     }
 
@@ -501,10 +509,15 @@ pub const Server = struct {
                 if (payload.len < 1) return;
                 const dir_raw = payload[0];
                 const dir = std.meta.intToEnum(protocol.Direction, dir_raw) catch return;
+                // Content area: row 1 (tab bar) to client_rows-2 (status bar)
+                const status_bar_rows: u16 = if (self.config.status_bar and self.client_rows > 0) 1 else 0;
+                const tab_bar_rows: u16 = if (self.client_rows > 0) 1 else 0;
+                const reserved = tab_bar_rows + status_bar_rows;
+                const content_rows = if (self.client_rows > reserved) self.client_rows - reserved else self.client_rows;
                 const total_region = pane_mod.Region{
-                    .row = 0,
+                    .row = tab_bar_rows,
                     .col = 0,
-                    .rows = if (self.client_rows > 1) self.client_rows - 1 else self.client_rows,
+                    .rows = content_rows,
                     .cols = self.client_cols,
                 };
                 const regions = active_tab.pane_tree.calculateRegions(total_region) catch return;
@@ -686,34 +699,73 @@ pub const Server = struct {
     // ── compose ───────────────────────────────────────────────────────────────
 
     /// Composite all pane screen buffers onto the Screen, draw borders,
-    /// render the status bar, send dirty regions to the client.
+    /// render the tab bar and status bar, send dirty regions to the client.
     pub fn compose(self: *Server) void {
         // Clear back buffer
         self.screen.clear();
 
         const status_bar_rows: u16 = if (self.config.status_bar and self.client_rows > 0) 1 else 0;
-        const content_rows = self.client_rows -| status_bar_rows;
+        // Row 0 is reserved for the tab bar; last row for the status bar.
+        const tab_bar_rows: u16 = if (self.client_rows > 0) 1 else 0;
+        const reserved_rows = tab_bar_rows + status_bar_rows;
+        const content_rows = self.client_rows -| reserved_rows;
+        const content_start_row = tab_bar_rows;
 
         const total_region = pane_mod.Region{
-            .row = 0,
+            .row = content_start_row,
             .col = 0,
             .rows = content_rows,
             .cols = self.client_cols,
         };
+
+        // Collect tab names (used by both tab bar and status bar)
+        var tab_names_buf: [tab_mod.MAX_TABS][]const u8 = undefined;
+        var tab_names_len: usize = 0;
+        for (&self.tab_manager.tabs) |*slot| {
+            if (slot.*) |*t| {
+                tab_names_buf[tab_names_len] = t.getName();
+                tab_names_len += 1;
+            }
+        }
+        const tab_names = tab_names_buf[0..tab_names_len];
+
+        // Render tab bar in row 0
+        if (tab_bar_rows > 0 and self.screen.rows > 0) {
+            const tab_bar_start: usize = 0;
+            const tab_bar_end = @as(usize, self.screen.cols);
+            if (tab_bar_end <= self.screen.back.len) {
+                const tab_bar_cells = self.screen.back[tab_bar_start..tab_bar_end];
+                status_bar_mod.renderTabBar(
+                    tab_bar_cells,
+                    self.screen.cols,
+                    tab_names,
+                    self.tab_manager.active,
+                );
+            }
+        }
 
         // Calculate pane regions for the active tab
         const active_tab = self.tab_manager.activeTab();
         const regions = active_tab.pane_tree.calculateRegions(total_region) catch return;
         defer self.allocator.free(regions);
 
-        // For each pane region, draw border and copy pane content inset by 1
+        // For each pane region, draw border with title and copy pane content inset by 1
         for (regions) |entry| {
             const pane_state = self.pane_states.get(entry.id) orelse continue;
             const region = entry.region;
             const is_active = (entry.id == active_tab.pane_tree.active_pane);
 
-            // Draw border around pane region
-            self.screen.drawBorder(region, is_active);
+            // Use pane title if set, otherwise generate a default "Pane N" label.
+            var default_title_buf: [16]u8 = undefined;
+            const title: []const u8 = if (pane_state.title_len > 0)
+                pane_state.title[0..pane_state.title_len]
+            else blk: {
+                const s = std.fmt.bufPrint(&default_title_buf, "Pane {d}", .{entry.id + 1}) catch "Pane";
+                break :blk s;
+            };
+
+            // Draw zellij-style border with title in top frame line
+            self.screen.drawBorderWithTitle(region, title, is_active);
 
             // Content area is inset by 1 on each side for the border
             const inner_row = region.row + 1;
@@ -754,26 +806,14 @@ pub const Server = struct {
             if (bar_row < self.screen.rows) {
                 const bar_start = @as(usize, bar_row) * self.screen.cols;
                 const bar_end = bar_start + self.screen.cols;
-                const bar_cells = self.screen.back[bar_start..bar_end];
-
-                // Collect tab names
-                var tab_names_buf: [tab_mod.MAX_TABS][]const u8 = undefined;
-                var tab_names_len: usize = 0;
-                for (&self.tab_manager.tabs) |*slot| {
-                    if (slot.*) |*t| {
-                        tab_names_buf[tab_names_len] = t.getName();
-                        tab_names_len += 1;
-                    }
+                if (bar_end <= self.screen.back.len) {
+                    const bar_cells = self.screen.back[bar_start..bar_end];
+                    status_bar_mod.renderStatusBar(
+                        bar_cells,
+                        self.screen.cols,
+                        self.current_mode,
+                    );
                 }
-                const tab_names = tab_names_buf[0..tab_names_len];
-
-                status_bar_mod.renderStatusBar(
-                    bar_cells,
-                    self.screen.cols,
-                    self.current_mode,
-                    tab_names,
-                    self.tab_manager.active,
-                );
             }
         }
 

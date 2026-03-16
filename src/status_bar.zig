@@ -14,15 +14,26 @@ const COLOR_BLUE: vt.Color = .{ .idx = 4 };
 const COLOR_MAGENTA: vt.Color = .{ .idx = 5 };
 const COLOR_RED: vt.Color = .{ .idx = 1 };
 const COLOR_DARK_GREY: vt.Color = .{ .idx = 8 };
+const COLOR_WHITE: vt.Color = .{ .idx = 7 };
+const COLOR_BRIGHT_WHITE: vt.Color = .{ .idx = 15 };
 
 // Default status bar background (dark grey / colour 0 for contrast).
 const BAR_BG: vt.Color = .{ .idx = 0 };
 // Dimmed hint text — bright black / dark grey foreground.
 const HINT_FG: vt.Color = .{ .idx = 8 };
-// Active tab highlight — white foreground, slightly lighter background.
-const TAB_ACTIVE_FG: vt.Color = .{ .idx = 15 };
-const TAB_ACTIVE_BG: vt.Color = .{ .idx = 8 };
+
+// Tab bar colors
+// Active tab: green background (idx 2), black text
+const TAB_ACTIVE_FG: vt.Color = .{ .idx = 0 };
+const TAB_ACTIVE_BG: vt.Color = .{ .idx = 2 };
+// Inactive tab: dark grey background, white text
 const TAB_INACTIVE_FG: vt.Color = .{ .idx = 7 };
+const TAB_INACTIVE_BG: vt.Color = .{ .idx = 8 };
+// Tab bar background (fills spaces between/around tabs)
+const TAB_BAR_BG: vt.Color = .{ .idx = 0 };
+
+// Separator between mode label and hints
+const SEP_FG: vt.Color = .{ .idx = 8 };
 
 // ─── ModeInfo ─────────────────────────────────────────────────────────────────
 
@@ -39,45 +50,46 @@ fn modeInfo(m: mode_mod.Mode) ModeInfo {
             .label = " NORMAL ",
             .fg = COLOR_BLACK,
             .bg = COLOR_GREEN,
-            .hint = "Ctrl+p:PANE | Ctrl+t:TAB | Ctrl+s:SCROLL | Ctrl+o:SESSION",
+            .hint = "Ctrl+p \xe2\x86\x92 Pane | Ctrl+t \xe2\x86\x92 Tab | Ctrl+s \xe2\x86\x92 Scroll | Ctrl+o \xe2\x86\x92 Session | Ctrl+g \xe2\x86\x92 Lock",
         },
         .pane => .{
             .label = " PANE ",
             .fg = COLOR_BLACK,
             .bg = COLOR_BLUE,
-            .hint = "h/j/k/l:focus | H/J/K/L:resize | n:split-h | v:split-v | x:close",
+            .hint = "\xe2\x86\x90 \xe2\x86\x93 \xe2\x86\x91 \xe2\x86\x92 Move | n New | v VSplit | x Close | Esc Normal",
         },
         .tab => .{
             .label = " TAB ",
             .fg = COLOR_BLACK,
             .bg = COLOR_MAGENTA,
-            .hint = "h/l:switch | n:new | x:close | r:rename",
+            .hint = "\xe2\x86\x90 \xe2\x86\x92 Switch | n New | x Close | r Rename | Esc Normal",
         },
         .scroll => .{
             .label = " SCROLL ",
             .fg = COLOR_BLACK,
             .bg = COLOR_YELLOW,
-            .hint = "j/k:line | u/d:page",
+            .hint = "\xe2\x86\x91 \xe2\x86\x93 Line | u d Page | Esc Normal",
         },
         .session => .{
             .label = " SESSION ",
             .fg = COLOR_BLACK,
             .bg = COLOR_RED,
-            .hint = "d:detach | q:quit",
+            .hint = "d Detach | q Quit | Esc Normal",
         },
         .locked => .{
             .label = " LOCKED ",
             .fg = COLOR_BLACK,
             .bg = COLOR_DARK_GREY,
-            .hint = "Ctrl+g to unlock",
+            .hint = "Ctrl+g \xe2\x86\x92 Unlock",
         },
     };
 }
 
 // ─── writeString ─────────────────────────────────────────────────────────────
 
-/// Write ASCII text into `cells` starting at `offset.*`, advancing offset.
-/// Stops when the text is exhausted or when the cells slice is full.
+/// Write UTF-8 text into `cells` starting at `offset.*`, advancing offset.
+/// Each Unicode codepoint occupies one cell. Stops when text is exhausted
+/// or when the cells slice is full. Invalid UTF-8 bytes are skipped.
 pub fn writeString(
     cells: []render.Cell,
     offset: *u16,
@@ -85,27 +97,36 @@ pub fn writeString(
     fg: vt.Color,
     bg: vt.Color,
 ) void {
-    for (text) |ch| {
+    var i: usize = 0;
+    while (i < text.len) {
         if (offset.* >= cells.len) break;
+        const cp_len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+            i += 1;
+            continue;
+        };
+        if (i + cp_len > text.len) break;
+        const cp = std.unicode.utf8Decode(text[i .. i + cp_len]) catch {
+            i += 1;
+            continue;
+        };
         cells[offset.*] = render.Cell{
-            .char = ch,
+            .char = cp,
             .fg = fg,
             .bg = bg,
         };
         offset.* += 1;
+        i += cp_len;
     }
 }
 
 // ─── renderStatusBar ─────────────────────────────────────────────────────────
 
 /// Fill `cells` (one row, length == cols) with the status bar layout:
-///   [mode label] [key hints (dimmed)] ... [tab list (right)]
+///   [mode label] [│] [key hints (dimmed)]
 pub fn renderStatusBar(
     cells: []render.Cell,
     cols: u16,
     current_mode: mode_mod.Mode,
-    tab_names: []const []const u8,
-    active_tab: u8,
 ) void {
     // Fill entire row with background first.
     const safe_cols = @min(cols, @as(u16, @intCast(cells.len)));
@@ -120,42 +141,49 @@ pub fn renderStatusBar(
     // ── Left: mode label ─────────────────────────────────────────────────────
     writeString(cells, &offset, info.label, info.fg, info.bg);
 
+    // ── Separator ─────────────────────────────────────────────────────────────
+    writeString(cells, &offset, " \xe2\x94\x82 ", SEP_FG, BAR_BG);
+
     // ── Middle: key hints ─────────────────────────────────────────────────────
-    // One space separator, then the hint string.
-    writeString(cells, &offset, " ", HINT_FG, BAR_BG);
     writeString(cells, &offset, info.hint, HINT_FG, BAR_BG);
+}
 
-    // ── Right: tab list ───────────────────────────────────────────────────────
-    // Build the tab list string length to figure out where to start.
-    // Each tab: "[name]" with a space between tabs and one trailing space.
-    // We write it right-aligned by computing total width first.
+// ─── renderTabBar ─────────────────────────────────────────────────────────────
 
-    // Compute right-section width.
-    var right_width: u16 = 0;
-    for (tab_names, 0..) |name, i| {
-        right_width += 1; // '['
-        right_width += @intCast(name.len);
-        right_width += 1; // ']'
-        if (i + 1 < tab_names.len) right_width += 1; // space between
+/// Fill `cells` (one row, length == cols) with the zellij-style tab bar:
+///   Dark background, each tab as a "ribbon": ` TabName `
+///   Active tab: green bg (idx 2) + black text
+///   Inactive tab: dark grey bg (idx 8) + white text
+pub fn renderTabBar(
+    cells: []render.Cell,
+    cols: u16,
+    tab_names: []const []const u8,
+    active_tab: u8,
+) void {
+    // Fill entire row with tab bar background first.
+    const safe_cols = @min(cols, @as(u16, @intCast(cells.len)));
+    for (cells[0..safe_cols]) |*c| {
+        c.* = render.Cell{ .char = ' ', .fg = .default, .bg = TAB_BAR_BG };
     }
-    if (right_width > 0) right_width += 1; // leading space margin
 
-    // Only render tabs if they fit.
-    if (right_width > 0 and right_width <= cols) {
-        var tab_offset: u16 = cols - right_width;
-        // Leading margin space.
-        writeString(cells, &tab_offset, " ", .default, BAR_BG);
-        for (tab_names, 0..) |name, i| {
-            const is_active = (i == @as(usize, active_tab));
-            const tab_fg = if (is_active) TAB_ACTIVE_FG else TAB_INACTIVE_FG;
-            const tab_bg = if (is_active) TAB_ACTIVE_BG else BAR_BG;
-            writeString(cells, &tab_offset, "[", tab_fg, tab_bg);
-            writeString(cells, &tab_offset, name, tab_fg, tab_bg);
-            writeString(cells, &tab_offset, "]", tab_fg, tab_bg);
-            if (i + 1 < tab_names.len) {
-                writeString(cells, &tab_offset, " ", .default, BAR_BG);
-            }
+    var offset: u16 = 0;
+
+    for (tab_names, 0..) |name, i| {
+        const is_active = (i == @as(usize, active_tab));
+        const tab_fg = if (is_active) TAB_ACTIVE_FG else TAB_INACTIVE_FG;
+        const tab_bg = if (is_active) TAB_ACTIVE_BG else TAB_INACTIVE_BG;
+
+        // Each tab: " name " with padding
+        writeString(cells, &offset, " ", tab_fg, tab_bg);
+        writeString(cells, &offset, name, tab_fg, tab_bg);
+        writeString(cells, &offset, " ", tab_fg, tab_bg);
+
+        // One space gap between tabs (on bar background)
+        if (i + 1 < tab_names.len) {
+            writeString(cells, &offset, " ", .default, TAB_BAR_BG);
         }
+
+        if (offset >= safe_cols) break;
     }
 }
 
@@ -165,7 +193,7 @@ const testing = std.testing;
 
 test "renders mode indicator" {
     var cells: [80]render.Cell = undefined;
-    renderStatusBar(&cells, 80, .normal, &[_][]const u8{}, 0);
+    renderStatusBar(&cells, 80, .normal);
 
     // First cell of NORMAL label should be ' ' with green background.
     const first = cells[0];
@@ -191,8 +219,8 @@ test "different modes have different hints" {
     var cells_normal: [120]render.Cell = undefined;
     var cells_pane: [120]render.Cell = undefined;
 
-    renderStatusBar(&cells_normal, 120, .normal, &[_][]const u8{}, 0);
-    renderStatusBar(&cells_pane, 120, .pane, &[_][]const u8{}, 0);
+    renderStatusBar(&cells_normal, 120, .normal);
+    renderStatusBar(&cells_pane, 120, .pane);
 
     // The hint text starts somewhere after the label.  Find the first cell
     // where the two renders differ — that position should be within the label
@@ -214,55 +242,55 @@ test "different modes have different hints" {
     try testing.expectEqual(@as(u21, 'N'), cells_normal[1].char);
 }
 
-test "tab list rendered" {
+test "renderTabBar renders tab names" {
     var cells: [80]render.Cell = undefined;
     const tab_names = [_][]const u8{ "alpha", "beta" };
-    renderStatusBar(&cells, 80, .normal, &tab_names, 0);
+    renderTabBar(&cells, 80, &tab_names, 0);
 
-    // Scan cells for '[' characters that begin a tab entry.
-    var found_alpha = false;
-    var found_beta = false;
-    var i: usize = 0;
-    while (i < 80) : (i += 1) {
-        if (cells[i].char == '[') {
-            // Check if next chars spell a known tab name.
-            if (i + 5 < 80 and
-                cells[i + 1].char == 'a' and
-                cells[i + 2].char == 'l' and
-                cells[i + 3].char == 'p' and
-                cells[i + 4].char == 'h' and
-                cells[i + 5].char == 'a')
-            {
-                found_alpha = true;
-            }
-            if (i + 4 < 80 and
-                cells[i + 1].char == 'b' and
-                cells[i + 2].char == 'e' and
-                cells[i + 3].char == 't' and
-                cells[i + 4].char == 'a')
-            {
-                found_beta = true;
-            }
-        }
-    }
+    // Tab bar format: " alpha " " beta " with spaces between
+    // Offset 0: ' ' (padding before alpha), offset 1-5: 'alpha', offset 6: ' '
+    try testing.expectEqual(@as(u21, ' '), cells[0].char);
+    try testing.expectEqual(@as(u21, 'a'), cells[1].char);
+    try testing.expectEqual(@as(u21, 'l'), cells[2].char);
+    try testing.expectEqual(@as(u21, 'p'), cells[3].char);
+    try testing.expectEqual(@as(u21, 'h'), cells[4].char);
+    try testing.expectEqual(@as(u21, 'a'), cells[5].char);
+    try testing.expectEqual(@as(u21, ' '), cells[6].char);
 
-    try testing.expect(found_alpha);
-    try testing.expect(found_beta);
-
-    // Active tab (index 0 = "alpha") should use the active highlight bg.
-    // Find the '[' before "alpha" and check its bg.
-    var alpha_bracket_idx: usize = 0;
-    i = 0;
-    while (i < 80) : (i += 1) {
-        if (cells[i].char == '[' and i + 5 < 80 and
-            cells[i + 1].char == 'a' and cells[i + 2].char == 'l')
-        {
-            alpha_bracket_idx = i;
-            break;
-        }
-    }
-    switch (cells[alpha_bracket_idx].bg) {
-        .idx => |idx_val| try testing.expectEqual(@as(u8, 8), idx_val), // TAB_ACTIVE_BG
+    // Active tab (index 0 = "alpha") should use green background (idx 2).
+    switch (cells[1].bg) {
+        .idx => |i| try testing.expectEqual(@as(u8, 2), i), // TAB_ACTIVE_BG = green
         else => return error.WrongActiveTabColor,
+    }
+    // Active tab text should be black (idx 0).
+    switch (cells[1].fg) {
+        .idx => |i| try testing.expectEqual(@as(u8, 0), i),
+        else => return error.WrongActiveTabFg,
+    }
+
+    // beta tab (inactive) should have dark grey background (idx 8).
+    // beta starts at offset 8 (' ' gap at 7, then ' beta ')
+    // Layout: " alpha " + " " + " beta "
+    // 0: ' ', 1-5: alpha, 6: ' ', 7: gap-space, 8: ' ', 9-12: beta, 13: ' '
+    switch (cells[9].bg) {
+        .idx => |i| try testing.expectEqual(@as(u8, 8), i), // TAB_INACTIVE_BG
+        else => return error.WrongInactiveTabColor,
+    }
+}
+
+test "renderTabBar single tab" {
+    var cells: [40]render.Cell = undefined;
+    const tab_names = [_][]const u8{"Tab 1"};
+    renderTabBar(&cells, 40, &tab_names, 0);
+
+    // Single tab: " Tab 1 " starting at offset 0
+    try testing.expectEqual(@as(u21, ' '), cells[0].char);
+    try testing.expectEqual(@as(u21, 'T'), cells[1].char);
+    try testing.expectEqual(@as(u21, 'a'), cells[2].char);
+    try testing.expectEqual(@as(u21, 'b'), cells[3].char);
+    // Active tab green background
+    switch (cells[1].bg) {
+        .idx => |i| try testing.expectEqual(@as(u8, 2), i),
+        else => return error.WrongColor,
     }
 }

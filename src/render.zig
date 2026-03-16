@@ -93,13 +93,27 @@ pub const Screen = struct {
     /// Draw a box border around `region` using box-drawing characters.
     /// Active pane border is rendered with a brighter/colored style.
     pub fn drawBorder(self: *Screen, region: pane_mod.Region, is_active: bool) void {
+        self.drawBorderWithTitle(region, "", is_active);
+    }
+
+    /// Draw a zellij-style pane frame with a title in the top line.
+    /// Top line: ┌ Title ──────────┐
+    /// Sides:    │                 │
+    /// Bottom:   └─────────────────┘
+    /// Active pane border is green (idx 2), inactive is dark grey (idx 8).
+    pub fn drawBorderWithTitle(self: *Screen, region: pane_mod.Region, title: []const u8, is_active: bool) void {
         // Nothing to draw if the region has no border space.
         if (region.rows < 2 or region.cols < 2) return;
 
         const border_fg: vt.Color = if (is_active)
-            vt.Color{ .idx = 6 } // cyan for active
+            vt.Color{ .idx = 2 } // green for active (zellij style)
         else
             vt.Color{ .idx = 8 }; // dark grey for inactive
+
+        const title_fg: vt.Color = if (is_active)
+            vt.Color{ .idx = 15 } // bright white for active title
+        else
+            vt.Color{ .idx = 7 }; // white for inactive title
 
         const attr = vt.Attr{};
 
@@ -117,10 +131,50 @@ pub const Screen = struct {
         self.cellAt(r_bot, c_left).* = Cell{ .char = '└', .fg = border_fg, .attr = attr };
         self.cellAt(r_bot, c_right).* = Cell{ .char = '┘', .fg = border_fg, .attr = attr };
 
-        // Top and bottom edges
+        // Top edge: ┌ Title ──────────┐
+        // Layout: c_left+1 = ' ', c_left+2 = title chars, then ' ', then '─' fill
+        const inner_width: u16 = if (c_right > c_left + 1) c_right - c_left - 1 else 0;
+
+        if (inner_width > 0 and title.len > 0) {
+            // Write: space + title + space + dashes to fill
+            var c: u16 = c_left + 1;
+
+            // Leading space before title
+            if (c < c_right) {
+                self.cellAt(r_top, c).* = Cell{ .char = ' ', .fg = border_fg, .attr = attr };
+                c += 1;
+            }
+
+            // Title text (truncated to fit, leaving room for trailing space + at least one dash)
+            const max_title = if (inner_width > 3) inner_width - 3 else 0;
+            const title_len: u16 = @intCast(@min(title.len, max_title));
+            var ti: u16 = 0;
+            while (ti < title_len and c < c_right) : (ti += 1) {
+                self.cellAt(r_top, c).* = Cell{ .char = title[ti], .fg = title_fg, .attr = attr };
+                c += 1;
+            }
+
+            // Trailing space after title (only if title was written)
+            if (title_len > 0 and c < c_right) {
+                self.cellAt(r_top, c).* = Cell{ .char = ' ', .fg = border_fg, .attr = attr };
+                c += 1;
+            }
+
+            // Fill remainder with dashes
+            while (c < c_right) : (c += 1) {
+                self.cellAt(r_top, c).* = Cell{ .char = '─', .fg = border_fg, .attr = attr };
+            }
+        } else {
+            // No title: just dashes
+            var c: u16 = c_left + 1;
+            while (c < c_right) : (c += 1) {
+                self.cellAt(r_top, c).* = Cell{ .char = '─', .fg = border_fg, .attr = attr };
+            }
+        }
+
+        // Bottom edge: all dashes
         var c: u16 = c_left + 1;
         while (c < c_right) : (c += 1) {
-            self.cellAt(r_top, c).* = Cell{ .char = '─', .fg = border_fg, .attr = attr };
             self.cellAt(r_bot, c).* = Cell{ .char = '─', .fg = border_fg, .attr = attr };
         }
 
@@ -346,7 +400,7 @@ test "drawBorder" {
     try testing.expectEqual(@as(u21, '└'), screen.cellAt(r_bot, c_left).char);
     try testing.expectEqual(@as(u21, '┘'), screen.cellAt(r_bot, c_right).char);
 
-    // Top edge (not corners)
+    // Top edge (not corners) — no title so all dashes
     try testing.expectEqual(@as(u21, '─'), screen.cellAt(r_top, c_left + 1).char);
     try testing.expectEqual(@as(u21, '─'), screen.cellAt(r_top, c_right - 1).char);
 
@@ -355,5 +409,50 @@ test "drawBorder" {
     try testing.expectEqual(@as(u21, '│'), screen.cellAt(r_top + 1, c_right).char);
 
     // Interior cell is untouched.
+    try testing.expect(Cell.eql(screen.cellAt(r_top + 1, c_left + 1).*, Cell{}));
+}
+
+test "drawBorderWithTitle" {
+    // Screen big enough for a titled border.
+    var screen = try Screen.init(testing.allocator, 30, 10);
+    defer screen.deinit();
+
+    // region cols=16: inner_width=14, title "fish" len=4
+    // Layout: ┌ fish ──────┐
+    const region = pane_mod.Region{ .row = 0, .col = 0, .rows = 5, .cols = 16 };
+    screen.drawBorderWithTitle(region, "fish", true);
+
+    const r_top = region.row;
+    const r_bot = region.row + region.rows - 1;
+    const c_left = region.col;
+    const c_right = region.col + region.cols - 1;
+
+    // Corners
+    try testing.expectEqual(@as(u21, '┌'), screen.cellAt(r_top, c_left).char);
+    try testing.expectEqual(@as(u21, '┐'), screen.cellAt(r_top, c_right).char);
+    try testing.expectEqual(@as(u21, '└'), screen.cellAt(r_bot, c_left).char);
+    try testing.expectEqual(@as(u21, '┘'), screen.cellAt(r_bot, c_right).char);
+
+    // After ┌: space, then 'f','i','s','h', then space, then dashes
+    try testing.expectEqual(@as(u21, ' '), screen.cellAt(r_top, c_left + 1).char);
+    try testing.expectEqual(@as(u21, 'f'), screen.cellAt(r_top, c_left + 2).char);
+    try testing.expectEqual(@as(u21, 'i'), screen.cellAt(r_top, c_left + 3).char);
+    try testing.expectEqual(@as(u21, 's'), screen.cellAt(r_top, c_left + 4).char);
+    try testing.expectEqual(@as(u21, 'h'), screen.cellAt(r_top, c_left + 5).char);
+    try testing.expectEqual(@as(u21, ' '), screen.cellAt(r_top, c_left + 6).char);
+    // After the title+space, rest should be dashes up to corner
+    try testing.expectEqual(@as(u21, '─'), screen.cellAt(r_top, c_right - 1).char);
+
+    // Active border should be green (idx 2)
+    switch (screen.cellAt(r_top, c_left).fg) {
+        .idx => |i| try testing.expectEqual(@as(u8, 2), i),
+        else => return error.WrongActiveColor,
+    }
+
+    // Left/right side edges
+    try testing.expectEqual(@as(u21, '│'), screen.cellAt(r_top + 1, c_left).char);
+    try testing.expectEqual(@as(u21, '│'), screen.cellAt(r_top + 1, c_right).char);
+
+    // Interior untouched
     try testing.expect(Cell.eql(screen.cellAt(r_top + 1, c_left + 1).*, Cell{}));
 }
