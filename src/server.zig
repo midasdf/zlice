@@ -613,15 +613,6 @@ pub const Server = struct {
         };
         if (n == 0) return; // EOF — child process exited; EPOLLHUP handler will clean up
 
-        // Debug: dump first PTY output
-        {
-            const log_fd = std.posix.open("/tmp/zlice-pty-dump.bin", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch null;
-            if (log_fd) |fd| {
-                defer std.posix.close(fd);
-                _ = std.posix.write(fd, buf[0..n]) catch {};
-            }
-        }
-
         // Feed bytes through VT parser and update pane screen buffer
         for (buf[0..n]) |byte| {
             if (state.vt_parser.feed(byte)) |event| {
@@ -697,15 +688,6 @@ pub const Server = struct {
             const new_cols = if (rgn.cols > 2) rgn.cols - 2 else 1;
             const new_rows = if (rgn.rows > 2) rgn.rows - 2 else 1;
             if (pane_state.grid.cols != new_cols or pane_state.grid.viewport_rows != new_rows) {
-                {
-                    const log_fd = std.posix.open("/tmp/zlice-resize.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch null;
-                    if (log_fd) |fd| {
-                        defer std.posix.close(fd);
-                        var dbuf: [128]u8 = undefined;
-                        const msg = std.fmt.bufPrint(&dbuf, "RESIZE pane {}: {}x{} -> {}x{}\n", .{ entry.id, pane_state.grid.cols, pane_state.grid.viewport_rows, new_cols, new_rows }) catch "";
-                        _ = std.posix.write(fd, msg) catch {};
-                    }
-                }
                 // Resize PTY — kernel sends SIGWINCH to child
                 pane_state.pty.setSize(new_cols, new_rows) catch {};
                 // Resize grid with reflow
@@ -727,17 +709,6 @@ pub const Server = struct {
                 const s = std.fmt.bufPrint(&default_title_buf, "Pane {d}", .{entry.id + 1}) catch "Pane";
                 break :blk s;
             };
-
-            // Debug: log sizes
-            {
-                const log_fd = std.posix.open("/tmp/zlice-server-debug.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch null;
-                if (log_fd) |fd| {
-                    defer std.posix.close(fd);
-                    var dbuf: [256]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&dbuf, "region: row={} col={} rows={} cols={} | pane: cols={} rows={} | screen: {}x{}\n", .{ region.row, region.col, region.rows, region.cols, pane_state.grid.cols, pane_state.grid.viewport_rows, self.screen.cols, self.screen.rows }) catch "";
-                    _ = std.posix.write(fd, msg) catch {};
-                }
-            }
 
             // Draw zellij-style border with title in top frame line
             self.screen.drawBorderWithTitle(region, title, is_active);

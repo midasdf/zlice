@@ -6,22 +6,6 @@ const terminal = @import("terminal.zig");
 const input_mod = @import("input.zig");
 const mode_mod = @import("mode.zig");
 
-// ─── Debug ────────────────────────────────────────────────────────────────────
-
-var debug_fd: ?posix.fd_t = null;
-
-fn debugInit() void {
-    const fd_or_err = posix.open("/tmp/zlice-debug.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-    debug_fd = fd_or_err catch null;
-}
-
-fn debugLog(comptime fmt: []const u8, args: anytype) void {
-    const fd = debug_fd orelse return;
-    var buf: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = posix.write(fd, msg) catch {};
-}
-
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /// epoll user-data tags stored in the .u64 field.
@@ -91,9 +75,6 @@ pub fn sendFrame(
 /// 5. Dispatch events until the server sends `exit` or a fatal error occurs.
 /// 6. Restore the terminal and close resources on exit.
 pub fn run(socket_path: [:0]const u8) !void {
-    debugInit();
-    debugLog("client starting\n", .{});
-
     // ── Connect ──────────────────────────────────────────────────────────────
     const sock_fd = try connect(socket_path);
     defer posix.close(sock_fd);
@@ -112,7 +93,6 @@ pub fn run(socket_path: [:0]const u8) !void {
 
     // ── Hello ─────────────────────────────────────────────────────────────────
     const term_size = terminal.getSize(posix.STDOUT_FILENO) catch terminal.TerminalSize{ .cols = 80, .rows = 24 };
-    debugLog("terminal size: {}x{}\n", .{ term_size.cols, term_size.rows });
     const term_env = std.posix.getenv("TERM") orelse "xterm-256color";
 
     var hello_payload: [256]u8 = undefined;
@@ -189,19 +169,12 @@ pub fn run(socket_path: [:0]const u8) !void {
             else => return error.EpollWaitFailed,
         };
 
-        debugLog("epoll: {} events\n", .{n_events});
         for (events[0..n_events]) |ev| {
-            debugLog("  event tag={}\n", .{ev.data.u64});
             switch (ev.data.u64) {
                 FD_STDIN => {
                     var input_buf: [256]u8 = undefined;
-                    const n_read = posix.read(posix.STDIN_FILENO, &input_buf) catch |err| {
-                        debugLog("stdin read error: {}\n", .{err});
-                        break;
-                    };
-                    debugLog("stdin: {} bytes\n", .{n_read});
+                    const n_read = posix.read(posix.STDIN_FILENO, &input_buf) catch break;
                     if (n_read == 0) {
-                        debugLog("stdin EOF\n", .{});
                         running = false;
                         break;
                     }
@@ -210,9 +183,7 @@ pub fn run(socket_path: [:0]const u8) !void {
                         &input_parser,
                         &mode_state,
                         sock_fd,
-                    ) catch |err| {
-                        debugLog("handleStdinBytes error: {}\n", .{err});
-                    };
+                    ) catch break;
                 },
 
                 FD_SOCKET => {
