@@ -270,8 +270,6 @@ pub fn run(socket_path: [:0]const u8) !void {
                         .rows = new_size.rows,
                     });
                     try sendFrame(sock_fd, .resize, &resize_payload);
-                    // Clear screen so server's full redraw renders cleanly
-                    _ = posix.write(stdout_fd, "\x1b[2J\x1b[H") catch {};
                 },
 
                 else => {},

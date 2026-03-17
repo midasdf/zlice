@@ -921,9 +921,16 @@ pub const Server = struct {
                 pane_state.pty.setSize(new_cols, new_rows) catch {};
                 const new_len = @as(usize, new_cols) * @as(usize, new_rows);
                 const new_screen = self.allocator.alloc(vt_mod.Cell, new_len) catch continue;
-                // Clear — the shell will redraw after receiving SIGWINCH
                 @memset(new_screen, vt_mod.Cell{});
-                // Free old alt screen buf if size changed
+                // Copy existing content that fits into new dimensions
+                const copy_rows = @min(pane_state.rows, new_rows);
+                const copy_cols = @min(pane_state.cols, new_cols);
+                var r: u16 = 0;
+                while (r < copy_rows) : (r += 1) {
+                    const old_off = @as(usize, r) * pane_state.cols;
+                    const new_off = @as(usize, r) * new_cols;
+                    @memcpy(new_screen[new_off..][0..copy_cols], pane_state.screen[old_off..][0..copy_cols]);
+                }
                 if (pane_state.alt_screen_buf) |buf| {
                     self.allocator.free(buf);
                     pane_state.alt_screen_buf = null;
@@ -932,8 +939,6 @@ pub const Server = struct {
                 pane_state.screen = new_screen;
                 pane_state.cols = new_cols;
                 pane_state.rows = new_rows;
-                // Clamp cursor to new bounds but don't reset to 0,0
-                // The shell knows where the cursor is and will redraw accordingly
                 pane_state.cursor_row = @min(pane_state.cursor_row, new_rows -| 1);
                 pane_state.cursor_col = @min(pane_state.cursor_col, new_cols -| 1);
             }
