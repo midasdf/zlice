@@ -47,6 +47,7 @@ pub const Event = union(enum) {
     scroll_down: u16,
     insert_lines: u16,
     delete_lines: u16,
+    cursor_position_report, // DSR: app requests cursor position (CSI 6n)
     linefeed,
     carriage_return,
     backspace,
@@ -395,6 +396,11 @@ pub const Parser = struct {
             },
             // SGR
             'm' => return .{ .sgr = self.parseSgr() },
+            // DSR (Device Status Report) — CSI 6 n = request cursor position
+            'n' => {
+                if (self.rawParam(0) == 6) return .cursor_position_report;
+                return null;
+            },
             else => return null,
         }
     }

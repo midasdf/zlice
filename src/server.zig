@@ -153,6 +153,40 @@ pub const PaneState = struct {
             },
             .scroll_up => |n| self.scrollScreenUp(n),
             .scroll_down => |n| self.scrollScreenDown(n),
+            .insert_lines => |n| {
+                // Insert n blank lines at cursor row, pushing existing lines down
+                const count = @min(n, self.rows - self.cursor_row);
+                if (count == 0) return;
+                // Move lines down (backwards to avoid overlap)
+                var dst_row_i: isize = @as(isize, self.rows) - 1;
+                const count_i: isize = @intCast(count);
+                while (dst_row_i >= @as(isize, self.cursor_row) + count_i) : (dst_row_i -= 1) {
+                    const src_row: usize = @intCast(dst_row_i - count_i);
+                    const dst_row: usize = @intCast(dst_row_i);
+                    const src = src_row * self.cols;
+                    const dst = dst_row * self.cols;
+                    @memcpy(self.screen[dst..][0..self.cols], self.screen[src..][0..self.cols]);
+                }
+                // Clear inserted lines
+                const clear_start = @as(usize, self.cursor_row) * self.cols;
+                const clear_end = clear_start + @as(usize, count) * self.cols;
+                @memset(self.screen[clear_start..clear_end], vt_mod.Cell{});
+            },
+            .delete_lines => |n| {
+                // Delete n lines at cursor row, pulling lines up
+                const count = @min(n, self.rows - self.cursor_row);
+                if (count == 0) return;
+                const move_rows = self.rows - self.cursor_row - count;
+                if (move_rows > 0) {
+                    const src_start = @as(usize, self.cursor_row + count) * self.cols;
+                    const dst_start = @as(usize, self.cursor_row) * self.cols;
+                    const len = @as(usize, move_rows) * self.cols;
+                    std.mem.copyForwards(vt_mod.Cell, self.screen[dst_start..][0..len], self.screen[src_start..][0..len]);
+                }
+                // Clear vacated bottom lines
+                const clear_start = @as(usize, self.rows - count) * self.cols;
+                @memset(self.screen[clear_start..], vt_mod.Cell{});
+            },
             .sgr => |params| {
                 if (params.reset) {
                     self.pen_fg = .default;
@@ -212,6 +246,15 @@ pub const PaneState = struct {
                     self.pen_bg = .default;
                     self.pen_attr = .{};
                 }
+            },
+            .cursor_position_report => {
+                // Respond with ESC[row;colR (1-based)
+                var cpr_buf: [32]u8 = undefined;
+                const cpr = std.fmt.bufPrint(&cpr_buf, "\x1b[{d};{d}R", .{
+                    self.cursor_row + 1,
+                    self.cursor_col + 1,
+                }) catch return;
+                _ = self.pty.write(cpr) catch {};
             },
             else => {}, // bell, tab, cursor_visible, scroll_region etc.
         }
@@ -856,12 +899,10 @@ pub const Server = struct {
                 pane_state.screen = new_screen;
                 pane_state.cols = new_cols;
                 pane_state.rows = new_rows;
-                pane_state.cursor_row = 0;
-                pane_state.cursor_col = 0;
-                // Reset pen state for clean redraw
-                pane_state.pen_fg = .default;
-                pane_state.pen_bg = .default;
-                pane_state.pen_attr = .{};
+                // Clamp cursor to new bounds but don't reset to 0,0
+                // The shell knows where the cursor is and will redraw accordingly
+                pane_state.cursor_row = @min(pane_state.cursor_row, new_rows -| 1);
+                pane_state.cursor_col = @min(pane_state.cursor_col, new_cols -| 1);
             }
         }
 
