@@ -2,7 +2,7 @@
 
 **A terminal multiplexer under 100KB.**
 
-Written in Zig. Zero dependencies. Statically linked. Runs on a Raspberry Pi Zero with 512MB RAM.
+Written in Zig. Zero dependencies. Statically linked. Light enough to run where others won't.
 
 ```
 ┌ fish ─────────────────────────────┐┌ vim ──────────────────────────────┐
