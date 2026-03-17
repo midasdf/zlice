@@ -45,6 +45,7 @@ const DEFAULT_ROWS: u16 = 24;
 
 /// Per-pane runtime state (PTY + VT parser + scrollback + virtual screen).
 pub const PaneState = struct {
+    allocator: std.mem.Allocator,
     pty: pty_mod.Pty,
     vt_parser: vt_mod.Parser,
     scrollback: scrollback_mod.Scrollback,
@@ -62,6 +63,11 @@ pub const PaneState = struct {
     pen_fg: vt_mod.Color = .default,
     pen_bg: vt_mod.Color = .default,
     pen_attr: vt_mod.Attr = .{},
+    /// Alternate screen buffer support
+    alt_screen_buf: ?[]vt_mod.Cell = null,
+    saved_cursor_row: u16 = 0,
+    saved_cursor_col: u16 = 0,
+    in_alt_screen: bool = false,
 
     /// Apply a VT event to this pane's screen buffer.
     pub fn applyEvent(self: *PaneState, ev: vt_mod.Event) void {
@@ -172,7 +178,42 @@ pub const PaneState = struct {
                 @memcpy(self.title[0..len], t[0..len]);
                 self.title_len = len;
             },
-            else => {}, // bell, tab, alt_screen, cursor_visible, scroll_region etc.
+            .alt_screen => |enter| {
+                if (enter and !self.in_alt_screen) {
+                    // Enter alternate screen: save main buffer and cursor
+                    self.saved_cursor_row = self.cursor_row;
+                    self.saved_cursor_col = self.cursor_col;
+                    // Save main screen into alt_screen_buf
+                    if (self.alt_screen_buf == null) {
+                        self.alt_screen_buf = self.allocator.alloc(vt_mod.Cell, self.screen.len) catch null;
+                    }
+                    if (self.alt_screen_buf) |buf| {
+                        if (buf.len == self.screen.len) {
+                            @memcpy(buf, self.screen);
+                        }
+                    }
+                    // Clear screen for alt screen apps
+                    @memset(self.screen, vt_mod.Cell{});
+                    self.cursor_row = 0;
+                    self.cursor_col = 0;
+                    self.in_alt_screen = true;
+                } else if (!enter and self.in_alt_screen) {
+                    // Leave alternate screen: restore saved main buffer
+                    if (self.alt_screen_buf) |buf| {
+                        if (buf.len == self.screen.len) {
+                            @memcpy(self.screen, buf);
+                        }
+                    }
+                    self.cursor_row = self.saved_cursor_row;
+                    self.cursor_col = self.saved_cursor_col;
+                    self.in_alt_screen = false;
+                    // Reset pen
+                    self.pen_fg = .default;
+                    self.pen_bg = .default;
+                    self.pen_attr = .{};
+                }
+            },
+            else => {}, // bell, tab, cursor_visible, scroll_region etc.
         }
     }
 
@@ -667,6 +708,7 @@ pub const Server = struct {
         const state = try self.allocator.create(PaneState);
         errdefer self.allocator.destroy(state);
         state.* = PaneState{
+            .allocator = self.allocator,
             .pty = pty,
             .vt_parser = vt_mod.Parser.init(),
             .scrollback = sb,
@@ -703,6 +745,7 @@ pub const Server = struct {
         _ = r;
         s.pty.close();
         s.scrollback.deinit(self.allocator);
+        if (s.alt_screen_buf) |buf| self.allocator.free(buf);
         self.allocator.free(s.screen);
         self.allocator.destroy(s);
     }
@@ -1031,6 +1074,7 @@ test "PaneState applyEvent print" {
     defer sb.deinit(allocator);
 
     var state = PaneState{
+        .allocator = allocator,
         .pty = undefined, // not used in this test
         .vt_parser = vt_mod.Parser.init(),
         .scrollback = sb,
@@ -1059,6 +1103,7 @@ test "PaneState applyEvent cursor_pos" {
     defer sb.deinit(allocator);
 
     var state = PaneState{
+        .allocator = allocator,
         .pty = undefined,
         .vt_parser = vt_mod.Parser.init(),
         .scrollback = sb,
@@ -1090,6 +1135,7 @@ test "PaneState applyEvent erase_display 2" {
     defer sb.deinit(allocator);
 
     var state = PaneState{
+        .allocator = allocator,
         .pty = undefined,
         .vt_parser = vt_mod.Parser.init(),
         .scrollback = sb,
