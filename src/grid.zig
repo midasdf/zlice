@@ -97,10 +97,10 @@ pub const Grid = struct {
     /// Get a cell from the visible viewport. Row 0 is the top of the viewport.
     /// When rows.len > viewport_rows, the viewport is the last viewport_rows rows.
     pub fn getCell(self: *const Grid, row: u16, col: u16) Cell {
-        const total: u16 = @intCast(self.rows.items.len);
-        const viewport_start = if (total > self.viewport_rows) total - self.viewport_rows else 0;
-        const actual_row = viewport_start + row;
-        if (actual_row >= self.rows.items.len or col >= self.cols) return Cell{};
+        const total: usize = self.rows.items.len;
+        const viewport_start: usize = if (total > self.viewport_rows) total - self.viewport_rows else 0;
+        const actual_row: usize = viewport_start + row;
+        if (actual_row >= total or col >= self.cols) return Cell{};
         const r = self.rows.items[actual_row];
         if (col >= r.cells.len) return Cell{};
         return r.cells[col];
