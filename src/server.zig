@@ -65,8 +65,8 @@ pub const PaneState = struct {
                 self.title_len = len;
             },
             .device_attributes_request => {
-                // Respond as VT220-compatible terminal: ESC[?62;22c
-                _ = self.pty.write("\x1b[?62;22c") catch {};
+                // Respond as VT220-compatible terminal (same as zellij): ESC[?62;4c
+                _ = self.pty.write("\x1b[?62;4c") catch {};
             },
             else => {
                 if (self.grid.applyEvent(ev)) |cpr| {
