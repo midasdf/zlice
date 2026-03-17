@@ -198,6 +198,7 @@ pub const Grid = struct {
                         }
                     },
                     2 => {
+                        // Clear all visible rows
                         for (self.rows.items) |*r| {
                             @memset(r.cells, Cell{});
                         }
@@ -751,4 +752,32 @@ test "resize height only removes rows" {
 
     try grid.resize(10, 3);
     try std.testing.expectEqual(@as(usize, 3), grid.rows.items.len);
+}
+
+test "reflow preserves content through narrow-wide cycle" {
+    const alloc = std.testing.allocator;
+    var grid = try Grid.init(alloc, 20, 5);
+    defer grid.deinit();
+
+    // Write "hello world" on row 0
+    const text = "hello world";
+    for (text) |ch| {
+        _ = grid.applyEvent(.{ .print = ch });
+    }
+
+    // Verify initial state
+    try std.testing.expectEqual(@as(u21, 'h'), grid.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'd'), grid.getCell(0, 10).char);
+
+    // Resize to narrow (10 cols) — "hello worl" + "d"
+    try grid.resize(10, 5);
+    try std.testing.expectEqual(@as(u21, 'h'), grid.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'l'), grid.getCell(0, 9).char);
+
+    // Resize back to wide (20 cols) — should restore "hello world"  
+    try grid.resize(20, 5);
+    try std.testing.expectEqual(@as(u21, 'h'), grid.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'd'), grid.getCell(0, 10).char);
+    // After 'd', rest should be spaces
+    try std.testing.expectEqual(@as(u21, ' '), grid.getCell(0, 11).char);
 }

@@ -1007,6 +1007,8 @@ test "PaneState applyEvent erase_display 2" {
 
     state.applyEvent(.{ .erase_display = 2 });
 
+    // After erase_display 2 in normal mode, the viewport shows blank rows
+    // (old content is preserved above viewport)
     var r: u16 = 0;
     while (r < rows) : (r += 1) {
         var c: u16 = 0;
