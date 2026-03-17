@@ -88,8 +88,10 @@ pub const Pty = struct {
             const lang = posix.getenv("LANG") orelse "C.UTF-8";
             const shell_env = posix.getenv("SHELL") orelse "/bin/sh";
 
+            // Inherit TERM from parent (e.g. st-256color) instead of forcing xterm-256color
+            const term_val = posix.getenv("TERM") orelse "xterm-256color";
             var term_buf: [64]u8 = undefined;
-            const term_str = std.fmt.bufPrintZ(&term_buf, "TERM=xterm-256color", .{}) catch "TERM=xterm-256color";
+            const term_str = std.fmt.bufPrintZ(&term_buf, "TERM={s}", .{term_val}) catch "TERM=xterm-256color";
             var home_buf: [256]u8 = undefined;
             const home_str = std.fmt.bufPrintZ(&home_buf, "HOME={s}", .{home}) catch "HOME=/";
             var user_buf: [128]u8 = undefined;
@@ -101,16 +103,37 @@ pub const Pty = struct {
             var shell_buf: [256]u8 = undefined;
             const shell_str = std.fmt.bufPrintZ(&shell_buf, "SHELL={s}", .{shell_env}) catch "SHELL=/bin/sh";
 
-            const envp: [*:null]const ?[*:0]const u8 = &[_:null]?[*:0]const u8{
-                term_str,
-                home_str,
-                user_str,
-                path_str,
-                lang_str,
-                shell_str,
-                "TERM_PROGRAM=zlice",
-                "ZELLIJ=0", // Prevent zellij auto-start inside zlice
-            };
+            // Optional env vars from parent
+            const display = posix.getenv("DISPLAY");
+            var display_buf: [128]u8 = undefined;
+            const display_str: ?[:0]const u8 = if (display) |d|
+                (std.fmt.bufPrintZ(&display_buf, "DISPLAY={s}", .{d}) catch null)
+            else
+                null;
+
+            const xdg_rt = posix.getenv("XDG_RUNTIME_DIR");
+            var xdg_buf: [256]u8 = undefined;
+            const xdg_str: ?[:0]const u8 = if (xdg_rt) |x|
+                (std.fmt.bufPrintZ(&xdg_buf, "XDG_RUNTIME_DIR={s}", .{x}) catch null)
+            else
+                null;
+
+            // Build envp — up to 10 entries + null sentinel
+            var env_entries: [12]?[*:0]const u8 = [_]?[*:0]const u8{null} ** 12;
+            var env_idx: usize = 0;
+            env_entries[env_idx] = term_str; env_idx += 1;
+            env_entries[env_idx] = home_str; env_idx += 1;
+            env_entries[env_idx] = user_str; env_idx += 1;
+            env_entries[env_idx] = path_str; env_idx += 1;
+            env_entries[env_idx] = lang_str; env_idx += 1;
+            env_entries[env_idx] = shell_str; env_idx += 1;
+            env_entries[env_idx] = "TERM_PROGRAM=zlice"; env_idx += 1;
+            env_entries[env_idx] = "ZELLIJ=0"; env_idx += 1;
+            if (display_str) |s| { env_entries[env_idx] = s; env_idx += 1; }
+            if (xdg_str) |s| { env_entries[env_idx] = s; env_idx += 1; }
+            env_entries[env_idx] = null;
+
+            const envp: [*:null]const ?[*:0]const u8 = @ptrCast(&env_entries);
 
             posix.execveZ(shell, argv, envp) catch {};
             std.process.exit(1);
