@@ -565,7 +565,6 @@ pub const Server = struct {
                 self.client_cols = hp.cols;
                 self.client_rows = hp.rows;
                 self.screen.resize(hp.cols, hp.rows) catch {};
-                self.resizeAllPanes();
                 self.compose();
             },
             .input => {
@@ -587,7 +586,7 @@ pub const Server = struct {
                 self.client_cols = rp.cols;
                 self.client_rows = rp.rows;
                 self.screen.resize(rp.cols, rp.rows) catch {};
-                self.resizeAllPanes();
+                // compose() handles per-pane PTY resize dynamically
                 self.compose();
             },
             .state => {
