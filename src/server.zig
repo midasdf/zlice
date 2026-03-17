@@ -918,19 +918,12 @@ pub const Server = struct {
             const new_cols = if (rgn.cols > 2) rgn.cols - 2 else 1;
             const new_rows = if (rgn.rows > 2) rgn.rows - 2 else 1;
             if (pane_state.cols != new_cols or pane_state.rows != new_rows) {
+                // Resize PTY — this sends SIGWINCH to the child
                 pane_state.pty.setSize(new_cols, new_rows) catch {};
+                // Reallocate screen buffer
                 const new_len = @as(usize, new_cols) * @as(usize, new_rows);
                 const new_screen = self.allocator.alloc(vt_mod.Cell, new_len) catch continue;
                 @memset(new_screen, vt_mod.Cell{});
-                // Copy existing content that fits into new dimensions
-                const copy_rows = @min(pane_state.rows, new_rows);
-                const copy_cols = @min(pane_state.cols, new_cols);
-                var r: u16 = 0;
-                while (r < copy_rows) : (r += 1) {
-                    const old_off = @as(usize, r) * pane_state.cols;
-                    const new_off = @as(usize, r) * new_cols;
-                    @memcpy(new_screen[new_off..][0..copy_cols], pane_state.screen[old_off..][0..copy_cols]);
-                }
                 if (pane_state.alt_screen_buf) |buf| {
                     self.allocator.free(buf);
                     pane_state.alt_screen_buf = null;
@@ -939,8 +932,12 @@ pub const Server = struct {
                 pane_state.screen = new_screen;
                 pane_state.cols = new_cols;
                 pane_state.rows = new_rows;
-                pane_state.cursor_row = @min(pane_state.cursor_row, new_rows -| 1);
-                pane_state.cursor_col = @min(pane_state.cursor_col, new_cols -| 1);
+                // Place cursor at bottom-left where shell prompt typically redraws
+                pane_state.cursor_row = new_rows -| 1;
+                pane_state.cursor_col = 0;
+                // Ask child to redraw by sending "clear screen" via PTY
+                // This makes readline/fish redraw their prompt at the new width
+                _ = pane_state.pty.write("\x0c") catch {}; // Ctrl+L = clear/redraw
             }
         }
 
