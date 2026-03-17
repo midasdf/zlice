@@ -618,15 +618,19 @@ pub const Server = struct {
         if (n == 0) return; // EOF — child process exited; EPOLLHUP handler will clean up
 
         // Feed bytes through VT parser and update pane screen buffer
+        const was_in_alt = state.grid.in_alt_screen;
         for (buf[0..n]) |byte| {
             if (state.vt_parser.feed(byte)) |event| {
                 state.applyEvent(event);
             }
         }
+        const left_alt = was_in_alt and !state.grid.in_alt_screen;
 
         // Only re-render if this pane is in the active tab
         const active_tab = self.tab_manager.activeTab();
         if (self.isPaneInTree(active_tab.pane_tree.root, pane_id)) {
+            // Force full redraw when leaving alt screen (restored content differs from compositor)
+            if (left_alt) self.screen.invalidate();
             self.compose();
         }
     }
