@@ -396,6 +396,16 @@ pub const Grid = struct {
                     if (attr.hidden) self.pen_attr.hidden = true;
                     if (attr.strikethrough) self.pen_attr.strikethrough = true;
                 }
+                if (params.clear_attr) |clear| {
+                    if (clear.bold) self.pen_attr.bold = false;
+                    if (clear.dim) self.pen_attr.dim = false;
+                    if (clear.italic) self.pen_attr.italic = false;
+                    if (clear.underline) self.pen_attr.underline = false;
+                    if (clear.blink) self.pen_attr.blink = false;
+                    if (clear.inverse) self.pen_attr.inverse = false;
+                    if (clear.hidden) self.pen_attr.hidden = false;
+                    if (clear.strikethrough) self.pen_attr.strikethrough = false;
+                }
             },
             .alt_screen => |enter| {
                 if (enter and !self.in_alt_screen) {

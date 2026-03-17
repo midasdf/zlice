@@ -31,6 +31,7 @@ pub const Cell = struct {
 pub const SgrParams = struct {
     reset: bool = false,
     attr: ?Attr = null,
+    clear_attr: ?Attr = null, // bits set here indicate attributes to CLEAR in the pen
     fg: ?Color = null,
     bg: ?Color = null,
 };
@@ -125,16 +126,44 @@ pub const Parser = struct {
             .ground => {
                 switch (byte) {
                     0x1b => {
+                        // ESC interrupts any in-progress UTF-8 sequence
+                        self.utf8_len = 0;
+                        self.utf8_expected = 0;
                         self.state = .escape;
                         return null;
                     },
-                    '\n' => return .linefeed,
-                    '\r' => return .carriage_return,
-                    0x08 => return .backspace,
-                    '\t' => return .tab,
-                    0x07 => return .bell,
-                    0x20...0x7e => return .{ .print = byte },
-                    // UTF-8 multibyte start bytes
+                    '\n' => {
+                        self.utf8_len = 0;
+                        self.utf8_expected = 0;
+                        return .linefeed;
+                    },
+                    '\r' => {
+                        self.utf8_len = 0;
+                        self.utf8_expected = 0;
+                        return .carriage_return;
+                    },
+                    0x08 => {
+                        self.utf8_len = 0;
+                        self.utf8_expected = 0;
+                        return .backspace;
+                    },
+                    '\t' => {
+                        self.utf8_len = 0;
+                        self.utf8_expected = 0;
+                        return .tab;
+                    },
+                    0x07 => {
+                        self.utf8_len = 0;
+                        self.utf8_expected = 0;
+                        return .bell;
+                    },
+                    0x20...0x7e => {
+                        // Printable ASCII interrupts any in-progress UTF-8 sequence
+                        self.utf8_len = 0;
+                        self.utf8_expected = 0;
+                        return .{ .print = byte };
+                    },
+                    // UTF-8 multibyte start bytes — reset and start fresh
                     0xc0...0xdf => {
                         self.utf8_buf[0] = byte;
                         self.utf8_len = 1;
@@ -167,9 +196,17 @@ pub const Parser = struct {
                             }
                             return null;
                         }
-                        return null; // stray continuation byte
+                        // Stray continuation byte — discard
+                        self.utf8_len = 0;
+                        self.utf8_expected = 0;
+                        return null;
                     },
-                    else => return null,
+                    else => {
+                        // Other control chars — reset UTF-8 state
+                        self.utf8_len = 0;
+                        self.utf8_expected = 0;
+                        return null;
+                    },
                 }
             },
 
@@ -443,6 +480,8 @@ pub const Parser = struct {
         var result = SgrParams{};
         var attr = Attr{};
         var has_attr = false;
+        var clear_attr = Attr{};
+        var has_clear_attr = false;
 
         var i: usize = 0;
         const count = self.param_idx + 1;
@@ -465,6 +504,14 @@ pub const Parser = struct {
                 7 => { attr.inverse = true; has_attr = true; },
                 8 => { attr.hidden = true; has_attr = true; },
                 9 => { attr.strikethrough = true; has_attr = true; },
+                // Attribute-off codes
+                22 => { clear_attr.bold = true; clear_attr.dim = true; has_clear_attr = true; },
+                23 => { clear_attr.italic = true; has_clear_attr = true; },
+                24 => { clear_attr.underline = true; has_clear_attr = true; },
+                25 => { clear_attr.blink = true; has_clear_attr = true; },
+                27 => { clear_attr.inverse = true; has_clear_attr = true; },
+                28 => { clear_attr.hidden = true; has_clear_attr = true; },
+                29 => { clear_attr.strikethrough = true; has_clear_attr = true; },
                 // Foreground colors
                 30...37 => result.fg = .{ .idx = @intCast(p - 30) },
                 38 => {
@@ -507,6 +554,7 @@ pub const Parser = struct {
         }
 
         if (has_attr) result.attr = attr;
+        if (has_clear_attr) result.clear_attr = clear_attr;
         return result;
     }
 

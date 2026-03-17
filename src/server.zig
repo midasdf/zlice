@@ -99,6 +99,7 @@ pub const Server = struct {
     current_mode: mode_mod.Mode,
     socket_path: []const u8, // owned, for cleanup
     session_name: []const u8, // owned, for session save
+    next_pane_id: pane_mod.PaneId, // global pane ID counter (pane 0 is reserved for first tab)
 
     // ── init ──────────────────────────────────────────────────────────────────
 
@@ -177,6 +178,7 @@ pub const Server = struct {
             .current_mode = .normal,
             .socket_path = path_copy,
             .session_name = name_copy,
+            .next_pane_id = 1, // pane 0 is the initial pane of the first tab
         };
 
         // Spawn PTY for the initial pane (id=0)
@@ -413,13 +415,17 @@ pub const Server = struct {
 
         switch (cmd_id) {
             .split_horizontal => {
-                const new_id = active_tab.pane_tree.splitPane(active_id, .horizontal) catch return;
+                const new_id = self.next_pane_id;
+                _ = active_tab.pane_tree.splitPane(active_id, .horizontal, new_id) catch return;
+                self.next_pane_id += 1;
                 self.spawnPaneState(new_id) catch return;
                 active_tab.pane_tree.active_pane = new_id;
                 self.compose();
             },
             .split_vertical => {
-                const new_id = active_tab.pane_tree.splitPane(active_id, .vertical) catch return;
+                const new_id = self.next_pane_id;
+                _ = active_tab.pane_tree.splitPane(active_id, .vertical, new_id) catch return;
+                self.next_pane_id += 1;
                 self.spawnPaneState(new_id) catch return;
                 active_tab.pane_tree.active_pane = new_id;
                 self.compose();
@@ -468,11 +474,9 @@ pub const Server = struct {
                 self.compose();
             },
             .new_tab => {
-                const new_tab_idx = self.tab_manager.createTab() catch return;
-                _ = new_tab_idx;
-                // Spawn PTY for the new tab's initial pane (id = next_id - 1 in the new tree)
-                const new_active_tab = self.tab_manager.activeTab();
-                const new_pane_id = new_active_tab.pane_tree.active_pane;
+                const new_pane_id = self.next_pane_id;
+                _ = self.tab_manager.createTab(new_pane_id) catch return;
+                self.next_pane_id += 1;
                 self.spawnPaneState(new_pane_id) catch return;
                 self.compose();
             },
@@ -550,14 +554,19 @@ pub const Server = struct {
         const shell_z = try self.allocator.dupeZ(u8, shell);
         defer self.allocator.free(shell_z);
 
-        const inner = self.innerPaneSize();
-        const pty = try pty_mod.Pty.spawn(shell_z, inner.cols, inner.rows);
+        // Initial size: use client dimensions minus reserved UI rows/cols.
+        // The grid will be properly resized to the actual pane region on the first compose().
+        const reserved_rows: u16 = 2 + 2; // tab bar + status bar + border top/bottom
+        const reserved_cols: u16 = 2; // border left/right
+        const init_cols: u16 = if (self.client_cols > reserved_cols) self.client_cols - reserved_cols else 1;
+        const init_rows: u16 = if (self.client_rows > reserved_rows) self.client_rows - reserved_rows else 1;
+        const pty = try pty_mod.Pty.spawn(shell_z, init_cols, init_rows);
 
         const sb_lines = self.config.scrollback_lines;
         const sb_bytes = self.config.scrollback_max_bytes;
         const sb = try scrollback_mod.Scrollback.init(self.allocator, sb_lines, sb_bytes);
 
-        var grid = try grid_mod.Grid.init(self.allocator, inner.cols, inner.rows);
+        var grid = try grid_mod.Grid.init(self.allocator, init_cols, init_rows);
         errdefer grid.deinit();
 
         const state = try self.allocator.create(PaneState);
@@ -605,21 +614,32 @@ pub const Server = struct {
     // ── closePaneById ──────────────────────────────────────────────────────────
 
     fn closePaneById(self: *Server, pane_id: pane_mod.PaneId) void {
-        const active_tab = self.tab_manager.activeTab();
-        const was_active = (active_tab.pane_tree.active_pane == pane_id);
+        // Search all tabs to find which one contains this pane.
+        var found_tab_idx: ?u8 = null;
+        for (&self.tab_manager.tabs, 0..) |*slot, i| {
+            if (slot.*) |*t| {
+                if (self.isPaneInTree(t.pane_tree.root, pane_id)) {
+                    found_tab_idx = @intCast(i);
+                    break;
+                }
+            }
+        }
+        const tab_idx = found_tab_idx orelse return;
+        const tab = &(self.tab_manager.tabs[tab_idx].?);
+        const was_active = (tab.pane_tree.active_pane == pane_id);
 
         // Try to close in the pane tree — returns sibling or null if last pane
-        if (active_tab.pane_tree.closePane(pane_id)) |sibling| {
+        if (tab.pane_tree.closePane(pane_id)) |sibling| {
             self.destroyPaneState(pane_id);
             if (was_active) {
-                active_tab.pane_tree.active_pane = sibling;
+                tab.pane_tree.active_pane = sibling;
             }
             self.compose();
         } else {
             // Last pane in tab — close the tab or keep it empty
             self.destroyPaneState(pane_id);
             if (self.tab_manager.tabCount() > 1) {
-                _ = self.tab_manager.closeTab(self.tab_manager.active);
+                _ = self.tab_manager.closeTab(tab_idx);
                 self.compose();
             } else {
                 // Last tab, last pane — quit
@@ -633,15 +653,10 @@ pub const Server = struct {
     fn handlePtyOutput(self: *Server, pane_id: pane_mod.PaneId) void {
         const state = self.pane_states.get(pane_id) orelse return;
         var buf: [4096]u8 = undefined;
-        // Temporary debug: dump PTY output
-        const dump_fd = std.posix.open("/tmp/zlice-pty-dump.bin", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch null;
-        defer if (dump_fd) |fd| std.posix.close(fd);
         const n = state.pty.read(&buf) catch {
             return; // Error reading — HUP handler will clean up
         };
         if (n == 0) return; // EOF — child process exited; EPOLLHUP handler will clean up
-
-        if (dump_fd) |fd| _ = std.posix.write(fd, buf[0..n]) catch {};
 
         // Feed bytes through VT parser and update pane screen buffer
         const was_in_alt = state.grid.in_alt_screen;
@@ -892,32 +907,6 @@ pub const Server = struct {
             _ = r;
             posix.close(fd);
             self.client_fd = null;
-        }
-    }
-
-    // ── resizeAllPanes ────────────────────────────────────────────────────────
-
-    /// Compute the inner content size for a single pane (frame border inset + tab/status bar).
-    fn innerPaneSize(self: *Server) struct { cols: u16, rows: u16 } {
-        // 2 rows reserved (tab bar top + status bar bottom) + 2 for border top/bottom
-        const reserved_rows: u16 = 2 + 2;
-        // 2 cols for border left/right
-        const reserved_cols: u16 = 2;
-        return .{
-            .cols = if (self.client_cols > reserved_cols) self.client_cols - reserved_cols else 1,
-            .rows = if (self.client_rows > reserved_rows) self.client_rows - reserved_rows else 1,
-        };
-    }
-
-    fn resizeAllPanes(self: *Server) void {
-        const inner = self.innerPaneSize();
-        var it = self.pane_states.iterator();
-        while (it.next()) |entry| {
-            const state = entry.value_ptr.*;
-            if (state.grid.cols != inner.cols or state.grid.viewport_rows != inner.rows) {
-                state.pty.setSize(inner.cols, inner.rows) catch {};
-                state.grid.resize(inner.cols, inner.rows) catch {};
-            }
         }
     }
 

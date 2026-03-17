@@ -45,18 +45,16 @@ pub const LayoutNode = union(enum) {
 pub const PaneTree = struct {
     root: *LayoutNode,
     allocator: std.mem.Allocator,
-    next_id: PaneId,
     active_pane: PaneId,
 
-    /// Create a tree with a single root leaf pane (id = 0).
-    pub fn init(allocator: std.mem.Allocator) !PaneTree {
+    /// Create a tree with a single root leaf pane using `initial_id`.
+    pub fn init(allocator: std.mem.Allocator, initial_id: PaneId) !PaneTree {
         const root = try allocator.create(LayoutNode);
-        root.* = .{ .leaf = .{ .id = 0, .pty_fd = -1 } };
+        root.* = .{ .leaf = .{ .id = initial_id, .pty_fd = -1 } };
         return PaneTree{
             .root = root,
             .allocator = allocator,
-            .next_id = 1,
-            .active_pane = 0,
+            .active_pane = initial_id,
         };
     }
 
@@ -68,11 +66,8 @@ pub const PaneTree = struct {
     // ─── splitPane ────────────────────────────────────────────────────────────
 
     /// Split the leaf identified by `target_id`.  The leaf becomes `first`,
-    /// a fresh leaf becomes `second`.  Returns the new pane's ID.
-    pub fn splitPane(self: *PaneTree, target_id: PaneId, dir: SplitDir) !PaneId {
-        const new_id = self.next_id;
-        self.next_id += 1;
-
+    /// a fresh leaf with `new_id` becomes `second`.  Returns `new_id`.
+    pub fn splitPane(self: *PaneTree, target_id: PaneId, dir: SplitDir, new_id: PaneId) !PaneId {
         const new_leaf = try self.allocator.create(LayoutNode);
         new_leaf.* = .{ .leaf = .{ .id = new_id, .pty_fd = -1 } };
         errdefer self.allocator.destroy(new_leaf);
@@ -95,7 +90,6 @@ pub const PaneTree = struct {
         );
 
         if (!found) {
-            self.next_id -= 1;
             return error.PaneNotFound;
         }
 
@@ -558,7 +552,7 @@ fn subtreeContains(node: *const LayoutNode, id: PaneId) bool {
 const testing = std.testing;
 
 fn makeTree(allocator: std.mem.Allocator) !PaneTree {
-    return PaneTree.init(allocator);
+    return PaneTree.init(allocator, 0);
 }
 
 const full = Region{ .row = 0, .col = 0, .rows = 24, .cols = 80 };
@@ -585,7 +579,7 @@ test "horizontal split" {
     var tree = try makeTree(testing.allocator);
     defer tree.deinit();
 
-    const new_id = try tree.splitPane(0, .horizontal);
+    const new_id = try tree.splitPane(0, .horizontal, 1);
     try testing.expectEqual(@as(PaneId, 1), new_id);
     try testing.expectEqual(@as(usize, 2), tree.paneCount());
 
@@ -614,7 +608,7 @@ test "vertical split" {
     var tree = try makeTree(testing.allocator);
     defer tree.deinit();
 
-    const new_id = try tree.splitPane(0, .vertical);
+    const new_id = try tree.splitPane(0, .vertical, 1);
     try testing.expectEqual(@as(PaneId, 1), new_id);
     try testing.expectEqual(@as(usize, 2), tree.paneCount());
 
@@ -642,8 +636,8 @@ test "nested split" {
     var tree = try makeTree(testing.allocator);
     defer tree.deinit();
 
-    _ = try tree.splitPane(0, .horizontal); // pane 0 and pane 1 side by side
-    _ = try tree.splitPane(1, .vertical); // pane 1 splits into 1 (top) and 2 (bottom)
+    _ = try tree.splitPane(0, .horizontal, 1); // pane 0 and pane 1 side by side
+    _ = try tree.splitPane(1, .vertical, 2); // pane 1 splits into 1 (top) and 2 (bottom)
 
     try testing.expectEqual(@as(usize, 3), tree.paneCount());
 
@@ -665,7 +659,7 @@ test "close pane" {
     var tree = try makeTree(testing.allocator);
     defer tree.deinit();
 
-    const new_id = try tree.splitPane(0, .horizontal);
+    const new_id = try tree.splitPane(0, .horizontal, 1);
     try testing.expectEqual(@as(usize, 2), tree.paneCount());
 
     const sibling = tree.closePane(new_id);
@@ -685,7 +679,7 @@ test "focus direction" {
     var tree = try makeTree(testing.allocator);
     defer tree.deinit();
 
-    _ = try tree.splitPane(0, .horizontal); // pane 0 left, pane 1 right
+    _ = try tree.splitPane(0, .horizontal, 1); // pane 0 left, pane 1 right
 
     const regions = try tree.calculateRegions(full);
     defer testing.allocator.free(regions);
@@ -709,7 +703,7 @@ test "resize pane" {
     var tree = try makeTree(testing.allocator);
     defer tree.deinit();
 
-    _ = try tree.splitPane(0, .horizontal);
+    _ = try tree.splitPane(0, .horizontal, 1);
 
     // Default ratio is 0.5.  Resize pane 0 rightward by +20%.
     tree.resizePane(0, .right, 20);

@@ -311,7 +311,7 @@ test "save and load round-trip" {
     var mgr = try tab_mod.TabManager.init(allocator);
     defer mgr.deinit();
     mgr.activeTab().setName("dev");
-    _ = try mgr.createTab();
+    _ = try mgr.createTab(1);
     mgr.activeTab().setName("logs");
 
     try saveSessionToPath(allocator, file_path, &mgr);

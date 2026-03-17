@@ -34,7 +34,7 @@ pub const TabManager = struct {
     /// Create a TabManager with one initial tab named "Tab 1".
     pub fn init(allocator: std.mem.Allocator) !TabManager {
         var mgr = TabManager{ .allocator = allocator };
-        const tree = try pane.PaneTree.init(allocator);
+        const tree = try pane.PaneTree.init(allocator, 0);
         var tab: Tab = .{ .pane_tree = tree };
         tab.setName("Tab 1");
         mgr.tabs[0] = tab;
@@ -55,8 +55,9 @@ pub const TabManager = struct {
     }
 
     /// Create a new tab auto-named "Tab N". Returns the index of the new tab.
+    /// `initial_pane_id` is the globally-unique ID assigned to the new tab's initial pane.
     /// Returns error.TabLimitReached if already at MAX_TABS.
-    pub fn createTab(self: *TabManager) !u8 {
+    pub fn createTab(self: *TabManager, initial_pane_id: pane.PaneId) !u8 {
         if (self.count >= MAX_TABS) return error.TabLimitReached;
 
         // Find first empty slot.
@@ -67,7 +68,7 @@ pub const TabManager = struct {
             return error.TabLimitReached;
         };
 
-        const tree = try pane.PaneTree.init(self.allocator);
+        const tree = try pane.PaneTree.init(self.allocator, initial_pane_id);
         var tab: Tab = .{ .pane_tree = tree };
 
         // Auto-name: "Tab N" where N = count + 1 (next tab number).
@@ -172,8 +173,8 @@ test "create multiple tabs" {
     var mgr = try TabManager.init(testing.allocator);
     defer mgr.deinit();
 
-    _ = try mgr.createTab();
-    _ = try mgr.createTab();
+    _ = try mgr.createTab(1);
+    _ = try mgr.createTab(2);
 
     try testing.expectEqual(@as(u8, 3), mgr.tabCount());
 }
@@ -182,7 +183,7 @@ test "close tab" {
     var mgr = try TabManager.init(testing.allocator);
     defer mgr.deinit();
 
-    _ = try mgr.createTab(); // index 1
+    _ = try mgr.createTab(1); // index 1
 
     // Close the first tab (index 0).
     const result = mgr.closeTab(0);
@@ -205,8 +206,8 @@ test "next/prev tab wraps" {
     var mgr = try TabManager.init(testing.allocator);
     defer mgr.deinit();
 
-    _ = try mgr.createTab(); // index 1
-    _ = try mgr.createTab(); // index 2
+    _ = try mgr.createTab(1); // index 1
+    _ = try mgr.createTab(2); // index 2
 
     // Set active to the last occupied slot.
     // Tabs are at indices 0, 1, 2 (count == 3).
