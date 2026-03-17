@@ -302,9 +302,10 @@ pub const Parser = struct {
                         return self.dispatchOsc();
                     },
                     0x1b => {
-                        // ESC starts ST (string terminator); next byte should be '\\'
-                        // We treat ESC here as terminator (peek-free state machine)
-                        self.state = .ground;
+                        // ESC starts ST (string terminator = ESC \)
+                        // Transition to escape state so the following '\' is consumed
+                        // by the escape handler (not printed as a character)
+                        self.state = .escape;
                         return self.dispatchOsc();
                     },
                     else => {
@@ -322,8 +323,8 @@ pub const Parser = struct {
             .dcs_passthrough => {
                 switch (byte) {
                     0x1b => {
-                        // ESC — next byte should be '\' for ST. Go to ground.
-                        self.state = .ground;
+                        // ESC starts ST (ESC \). Go to escape state to consume the '\'.
+                        self.state = .escape;
                         return null;
                     },
                     0x07 => {
