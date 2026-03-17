@@ -12,6 +12,7 @@ const render_mod = @import("render.zig");
 const status_bar_mod = @import("status_bar.zig");
 const config_mod = @import("config.zig");
 const mode_mod = @import("mode.zig");
+const session_mod = @import("session.zig");
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -97,12 +98,14 @@ pub const Server = struct {
     running: bool,
     current_mode: mode_mod.Mode,
     socket_path: []const u8, // owned, for cleanup
+    session_name: []const u8, // owned, for session save
 
     // ── init ──────────────────────────────────────────────────────────────────
 
     pub fn init(
         allocator: std.mem.Allocator,
         socket_path: [:0]const u8,
+        session_name: []const u8,
         config: config_mod.Config,
     ) !Server {
         // Ensure parent directory exists with mode 0o700
@@ -156,6 +159,9 @@ pub const Server = struct {
         const path_copy = try allocator.dupe(u8, socket_path);
         errdefer allocator.free(path_copy);
 
+        const name_copy = try allocator.dupe(u8, session_name);
+        errdefer allocator.free(name_copy);
+
         var srv = Server{
             .allocator = allocator,
             .config = config,
@@ -170,6 +176,7 @@ pub const Server = struct {
             .running = true,
             .current_mode = .normal,
             .socket_path = path_copy,
+            .session_name = name_copy,
         };
 
         // Spawn PTY for the initial pane (id=0)
@@ -203,6 +210,7 @@ pub const Server = struct {
             self.allocator.free(p);
         }
         self.allocator.free(self.socket_path);
+        self.allocator.free(self.session_name);
 
         self.tab_manager.deinit();
         self.screen.deinit();
@@ -321,9 +329,10 @@ pub const Server = struct {
                     }
 
                 } else if (tag == TAG_SIGNAL) {
-                    // SIGTERM or SIGINT
+                    // SIGTERM or SIGINT — save layout before exit
                     var ssi: linux.signalfd_siginfo = undefined;
                     _ = posix.read(sig_fd, std.mem.asBytes(&ssi)) catch {};
+                    session_mod.saveSession(self.allocator, self.session_name, &self.tab_manager) catch {};
                     self.running = false;
 
                 } else if (isPtyTag(tag)) {
@@ -522,10 +531,12 @@ pub const Server = struct {
                 }
             },
             .detach => {
-                // Disconnect client but keep server running
+                // Save layout before disconnect
+                session_mod.saveSession(self.allocator, self.session_name, &self.tab_manager) catch {};
                 self.disconnectClient();
             },
             .quit => {
+                session_mod.saveSession(self.allocator, self.session_name, &self.tab_manager) catch {};
                 self.running = false;
             },
         }

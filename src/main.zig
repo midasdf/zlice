@@ -59,7 +59,7 @@ fn runServer(allocator: std.mem.Allocator, cfg: *const config.Config, name: []co
     const socket_path = try getSocketPath(allocator, cfg, name);
     defer allocator.free(socket_path);
 
-    var srv = try server.Server.init(allocator, socket_path, cfg.*);
+    var srv = try server.Server.init(allocator, socket_path, name, cfg.*);
     defer srv.deinit();
 
     try srv.run();

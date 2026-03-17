@@ -33,7 +33,7 @@ Measured on Raspberry Pi Zero 2W (aarch64, Arch Linux ARM), March 2026:
 
 - **Pane splitting** — horizontal, vertical, resize, focus navigation
 - **Tabs** — create, close, switch
-- **Detach/attach** — disconnect and reconnect to running sessions
+- **Session persistence** — detach/attach, layout saved on detach/quit
 - **Zellij-style modes** — NORMAL, PANE, TAB, SCROLL, SESSION, LOCKED
 - **Text reflow** — content reflows when terminal width changes
 - **Scrollback** — preserved on screen clear, scroll mode to browse history
