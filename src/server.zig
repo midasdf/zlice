@@ -932,10 +932,19 @@ pub const Server = struct {
                 }
                 // Resize PTY — kernel sends SIGWINCH to child
                 pane_state.pty.setSize(new_cols, new_rows) catch {};
-                // Reallocate screen buffer
+                // Reallocate screen buffer and copy existing content
                 const new_len = @as(usize, new_cols) * @as(usize, new_rows);
                 const new_screen = self.allocator.alloc(vt_mod.Cell, new_len) catch continue;
                 @memset(new_screen, vt_mod.Cell{});
+                // Copy rows that fit
+                const copy_rows = @min(pane_state.rows, new_rows);
+                const copy_cols = @min(pane_state.cols, new_cols);
+                var cr: u16 = 0;
+                while (cr < copy_rows) : (cr += 1) {
+                    const old_off = @as(usize, cr) * pane_state.cols;
+                    const new_off = @as(usize, cr) * new_cols;
+                    @memcpy(new_screen[new_off..][0..copy_cols], pane_state.screen[old_off..][0..copy_cols]);
+                }
                 if (pane_state.alt_screen_buf) |buf| {
                     self.allocator.free(buf);
                     pane_state.alt_screen_buf = null;
