@@ -260,17 +260,64 @@ fn handleStdinBytes(
     mode_state: *mode_mod.ModeState,
     sock_fd: posix.fd_t,
 ) !void {
-    for (bytes) |byte| {
-        const maybe_key = input_parser.feed(byte);
-        const key = maybe_key orelse continue;
+    if (mode_state.current == .normal or mode_state.current == .locked) {
+        // In NORMAL/LOCKED mode, forward bytes directly to PTY for proper
+        // UTF-8 handling, but intercept mode-switch control keys.
+        var forward_start: usize = 0;
+        for (bytes, 0..) |byte, i| {
+            const maybe_key = input_parser.feed(byte);
+            const key = maybe_key orelse continue;
 
-        const action = mode_state.handleKey(key);
-        try dispatchAction(action, input_parser.lastSequence(), sock_fd);
-    }
-    // Flush any pending ESC that wasn't followed by '['
-    if (input_parser.flush()) |key| {
-        const action = mode_state.handleKey(key);
-        try dispatchAction(action, input_parser.lastSequence(), sock_fd);
+            const action = mode_state.handleKey(key);
+            switch (action) {
+                .forward_to_pty => {
+                    // Will be sent as part of the bulk forward below
+                },
+                .switch_mode => {
+                    // Flush any pending forward bytes before mode switch
+                    if (i + 1 > forward_start) {
+                        // Don't include the mode-switch byte itself
+                        // Find start of this key's sequence
+                        const seq = input_parser.lastSequence();
+                        const fwd_end = if (i + 1 >= seq.len) i + 1 - seq.len else i;
+                        if (fwd_end > forward_start) {
+                            try sendFrame(sock_fd, .input, bytes[forward_start..fwd_end]);
+                        }
+                    }
+                    try dispatchAction(action, input_parser.lastSequence(), sock_fd);
+                    forward_start = i + 1;
+                },
+                else => {
+                    try dispatchAction(action, input_parser.lastSequence(), sock_fd);
+                    forward_start = i + 1;
+                },
+            }
+        }
+        // Forward remaining bytes
+        if (forward_start < bytes.len) {
+            try sendFrame(sock_fd, .input, bytes[forward_start..]);
+        }
+        // Flush ESC if pending
+        if (input_parser.flush()) |key| {
+            const action = mode_state.handleKey(key);
+            if (action != .forward_to_pty) {
+                try dispatchAction(action, input_parser.lastSequence(), sock_fd);
+            }
+            // ESC byte already sent in the bulk forward
+        }
+    } else {
+        // In other modes (PANE, TAB, SCROLL, SESSION), parse key-by-key
+        for (bytes) |byte| {
+            const maybe_key = input_parser.feed(byte);
+            const key = maybe_key orelse continue;
+
+            const action = mode_state.handleKey(key);
+            try dispatchAction(action, input_parser.lastSequence(), sock_fd);
+        }
+        if (input_parser.flush()) |key| {
+            const action = mode_state.handleKey(key);
+            try dispatchAction(action, input_parser.lastSequence(), sock_fd);
+        }
     }
 }
 
