@@ -835,7 +835,7 @@ pub const Server = struct {
         const n = state.pty.read(&buf) catch {
             return; // Error reading — HUP handler will clean up
         };
-        if (n == 0) return; // No data yet — HUP handler will clean up if EOF
+        if (n == 0) return; // EOF — child process exited; EPOLLHUP handler will clean up
 
         // Debug: dump first PTY output
         {
