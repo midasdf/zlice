@@ -48,6 +48,7 @@ pub const Event = union(enum) {
     insert_lines: u16,
     delete_lines: u16,
     cursor_position_report, // DSR: app requests cursor position (CSI 6n)
+    device_attributes_request, // DA1: app requests terminal identity (CSI c / CSI 0c)
     linefeed,
     carriage_return,
     backspace,
@@ -399,6 +400,12 @@ pub const Parser = struct {
             // DSR (Device Status Report) — CSI 6 n = request cursor position
             'n' => {
                 if (self.rawParam(0) == 6) return .cursor_position_report;
+                return null;
+            },
+            // DA1 (Device Attributes) — CSI c or CSI 0 c
+            'c' => {
+                const p = self.rawParam(0);
+                if (p == 0) return .device_attributes_request;
                 return null;
             },
             else => return null,

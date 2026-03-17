@@ -56,13 +56,17 @@ pub const PaneState = struct {
     title: [64]u8 = [_]u8{0} ** 64,
     title_len: u8 = 0,
 
-    /// Apply a VT event — delegates to grid; handles set_title and CPR locally.
+    /// Apply a VT event — delegates to grid; handles set_title, CPR, and DA1 locally.
     pub fn applyEvent(self: *PaneState, ev: vt_mod.Event) void {
         switch (ev) {
             .set_title => |t| {
                 const len: u8 = @intCast(@min(t.len, self.title.len));
                 @memcpy(self.title[0..len], t[0..len]);
                 self.title_len = len;
+            },
+            .device_attributes_request => {
+                // Respond as VT220-compatible terminal: ESC[?62;22c
+                _ = self.pty.write("\x1b[?62;22c") catch {};
             },
             else => {
                 if (self.grid.applyEvent(ev)) |cpr| {
@@ -764,6 +768,24 @@ pub const Server = struct {
 
         // Send dirty regions to client
         self.sendDirtyRegions();
+
+        // Position cursor in active pane and show it
+        const active_pane_id = active_tab.pane_tree.active_pane;
+        if (self.pane_states.get(active_pane_id)) |active_state| {
+            // Find the active pane's region
+            for (regions) |entry| {
+                if (entry.id == active_pane_id) {
+                    const inner_row = entry.region.row + 1 + active_state.grid.cursor_row;
+                    const inner_col = entry.region.col + 1 + active_state.grid.cursor_col;
+                    var cursor_buf: [32]u8 = undefined;
+                    const cursor_seq = std.fmt.bufPrint(&cursor_buf, "\x1b[{d};{d}H\x1b[?25h", .{
+                        inner_row + 1, inner_col + 1,
+                    }) catch break;
+                    self.sendFrame(.render, cursor_seq) catch {};
+                    break;
+                }
+            }
+        }
 
         // Swap buffers
         self.screen.swapBuffers();

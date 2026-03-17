@@ -118,8 +118,8 @@ pub const Pty = struct {
             else
                 null;
 
-            // Build envp — up to 10 entries + null sentinel
-            var env_entries: [12]?[*:0]const u8 = [_]?[*:0]const u8{null} ** 12;
+            // Build envp — up to 12 entries + null sentinel
+            var env_entries: [14]?[*:0]const u8 = [_]?[*:0]const u8{null} ** 14;
             var env_idx: usize = 0;
             env_entries[env_idx] = term_str; env_idx += 1;
             env_entries[env_idx] = home_str; env_idx += 1;
@@ -129,6 +129,7 @@ pub const Pty = struct {
             env_entries[env_idx] = shell_str; env_idx += 1;
             env_entries[env_idx] = "TERM_PROGRAM=zlice"; env_idx += 1;
             env_entries[env_idx] = "ZELLIJ=0"; env_idx += 1;
+            env_entries[env_idx] = "fish_greeting="; env_idx += 1; // Suppress fish welcome message
             if (display_str) |s| { env_entries[env_idx] = s; env_idx += 1; }
             if (xdg_str) |s| { env_entries[env_idx] = s; env_idx += 1; }
             env_entries[env_idx] = null;
