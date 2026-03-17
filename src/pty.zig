@@ -127,9 +127,9 @@ pub const Pty = struct {
             env_entries[env_idx] = path_str; env_idx += 1;
             env_entries[env_idx] = lang_str; env_idx += 1;
             env_entries[env_idx] = shell_str; env_idx += 1;
-            env_entries[env_idx] = "TERM_PROGRAM=zlice"; env_idx += 1;
+            env_entries[env_idx] = "TERM_PROGRAM=zplit"; env_idx += 1;
             env_entries[env_idx] = "ZELLIJ=0"; env_idx += 1;
-            env_entries[env_idx] = "ZLICE=1"; env_idx += 1; // Prevent zlice auto-start nesting
+            env_entries[env_idx] = "ZPLIT=1"; env_idx += 1; // Prevent zplit auto-start nesting
             env_entries[env_idx] = "fish_greeting="; env_idx += 1; // Suppress fish welcome message
             if (display_str) |s| { env_entries[env_idx] = s; env_idx += 1; }
             if (xdg_str) |s| { env_entries[env_idx] = s; env_idx += 1; }

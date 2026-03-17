@@ -17,7 +17,7 @@ pub const Config = struct {
     status_bar_position: []const u8 = "bottom",
     pane_border_style: []const u8 = "single",
     // [session]
-    socket_dir: []const u8 = "/tmp/zlice-{uid}",
+    socket_dir: []const u8 = "/tmp/zplit-{uid}",
     auto_save_layout: bool = true,
 
     /// Allocator used for string fields. null when using compile-time defaults only.
@@ -137,12 +137,12 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
     return cfg;
 }
 
-/// Load config from ~/.config/zlice/config.toml.
+/// Load config from ~/.config/zplit/config.toml.
 /// Returns defaults if the file does not exist.
 /// All heap-allocated string fields must be freed by the caller.
 pub fn loadFromFile(allocator: std.mem.Allocator) !Config {
     const home = std.posix.getenv("HOME") orelse return Config{};
-    const path = try std.fmt.allocPrint(allocator, "{s}/.config/zlice/config.toml", .{home});
+    const path = try std.fmt.allocPrint(allocator, "{s}/.config/zplit/config.toml", .{home});
     defer allocator.free(path);
 
     const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
@@ -184,7 +184,7 @@ test "parse basic config" {
         \\pane_border_style = "double"
         \\
         \\[session]
-        \\socket_dir = "/run/user/1000/zlice"
+        \\socket_dir = "/run/user/1000/zplit"
         \\auto_save_layout = false
     ;
 
@@ -203,7 +203,7 @@ test "parse basic config" {
     try std.testing.expectEqual(false, cfg.status_bar);
     try std.testing.expectEqualStrings("top", cfg.status_bar_position);
     try std.testing.expectEqualStrings("double", cfg.pane_border_style);
-    try std.testing.expectEqualStrings("/run/user/1000/zlice", cfg.socket_dir);
+    try std.testing.expectEqualStrings("/run/user/1000/zplit", cfg.socket_dir);
     try std.testing.expectEqual(false, cfg.auto_save_layout);
 }
 
@@ -225,7 +225,7 @@ test "defaults when empty" {
     try std.testing.expectEqual(true, cfg.status_bar);
     try std.testing.expectEqualStrings("bottom", cfg.status_bar_position);
     try std.testing.expectEqualStrings("single", cfg.pane_border_style);
-    try std.testing.expectEqualStrings("/tmp/zlice-{uid}", cfg.socket_dir);
+    try std.testing.expectEqualStrings("/tmp/zplit-{uid}", cfg.socket_dir);
     try std.testing.expectEqual(true, cfg.auto_save_layout);
 }
 

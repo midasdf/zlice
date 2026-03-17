@@ -1,4 +1,4 @@
-# zlice
+# zplit
 
 **A terminal multiplexer under 100KB.**
 
@@ -19,7 +19,7 @@ Written in Zig. Zero dependencies. Statically linked. Light enough to run where 
 
 Measured on Raspberry Pi Zero 2W (aarch64, Arch Linux ARM), March 2026:
 
-| | zlice | tmux 3.6a | zellij 0.43.1 |
+| | zplit | tmux 3.6a | zellij 0.43.1 |
 |---|---|---|---|
 | Binary | **91 KB** | 1.3 MB | 44 MB |
 | Language | Zig | C | Rust + WASM |
@@ -27,7 +27,7 @@ Measured on Raspberry Pi Zero 2W (aarch64, Arch Linux ARM), March 2026:
 | Text reflow | Yes | No | Yes |
 | CJK width | Yes | Yes | Yes |
 
-> zlice binary = static aarch64 `ReleaseSmall` (92,848 bytes). tmux/zellij = installed size from `pacman -Si`/`pacman -Qi` on aarch64.
+> zplit binary = static aarch64 `ReleaseSmall` (92,848 bytes). tmux/zellij = installed size from `pacman -Si`/`pacman -Qi` on aarch64.
 
 ## Features
 
@@ -48,10 +48,10 @@ Measured on Raspberry Pi Zero 2W (aarch64, Arch Linux ARM), March 2026:
 
 ```bash
 # Requires Zig 0.15+
-git clone https://github.com/midasdf/zlice.git
-cd zlice
+git clone https://github.com/midasdf/zplit.git
+cd zplit
 zig build -Doptimize=ReleaseSmall
-# Binary at zig-out/bin/zlice (<100KB)
+# Binary at zig-out/bin/zplit (<100KB)
 ```
 
 ### Cross-compile for ARM
@@ -64,9 +64,9 @@ zig build -Doptimize=ReleaseSmall -Dtarget=aarch64-linux-gnu
 ## Usage
 
 ```bash
-zlice                    # Start new session
-zlice attach <name>      # Attach to existing session
-zlice list               # List sessions
+zplit                    # Start new session
+zplit attach <name>      # Attach to existing session
+zplit list               # List sessions
 ```
 
 ### Keybindings
@@ -95,7 +95,7 @@ All modes return to NORMAL with `Esc` or `Enter`.
 
 ## Configuration
 
-`~/.config/zlice/config.toml`
+`~/.config/zplit/config.toml`
 
 ```toml
 [general]

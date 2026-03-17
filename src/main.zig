@@ -181,7 +181,7 @@ fn listSessions(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\Usage: zlice [command] [args]
+        \\Usage: zplit [command] [args]
         \\
         \\Commands:
         \\  (none)              Start a new session (name "0")
@@ -229,7 +229,7 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         printUsage();
     } else if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v")) {
-        std.debug.print("zlice v0.1.0\n", .{});
+        std.debug.print("zplit v0.1.0\n", .{});
     } else {
         std.debug.print("Unknown command: {s}\n\n", .{cmd});
         printUsage();
@@ -260,14 +260,14 @@ test {
 test "getSocketDir replaces {uid}" {
     const allocator = std.testing.allocator;
     var cfg = config.Config{};
-    // Default socket_dir is "/tmp/zlice-{uid}"
+    // Default socket_dir is "/tmp/zplit-{uid}"
     const dir = try getSocketDir(allocator, &cfg);
     defer allocator.free(dir);
 
     // Should not contain the literal "{uid}" placeholder.
     try std.testing.expect(std.mem.indexOf(u8, dir, "{uid}") == null);
-    // Should start with "/tmp/zlice-".
-    try std.testing.expect(std.mem.startsWith(u8, dir, "/tmp/zlice-"));
+    // Should start with "/tmp/zplit-".
+    try std.testing.expect(std.mem.startsWith(u8, dir, "/tmp/zplit-"));
 }
 
 test "getSocketPath builds correct path" {
@@ -285,10 +285,10 @@ test "getSocketPath builds correct path" {
 test "getSocketPath no {uid} in template" {
     const allocator = std.testing.allocator;
     var cfg = config.Config{
-        .socket_dir = "/run/zlice",
+        .socket_dir = "/run/zplit",
     };
     const path = try getSocketPath(allocator, &cfg, "test");
     defer allocator.free(path);
 
-    try std.testing.expectEqualStrings("/run/zlice/test.sock", path);
+    try std.testing.expectEqualStrings("/run/zplit/test.sock", path);
 }

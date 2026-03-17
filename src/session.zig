@@ -33,11 +33,11 @@ pub const SavedSession = struct {
 
 // ─── Path Helpers ─────────────────────────────────────────────────────────────
 
-/// Returns the data directory path `~/.local/share/zlice/`.
+/// Returns the data directory path `~/.local/share/zplit/`.
 /// Caller owns the returned slice.
 pub fn getDataDir(allocator: std.mem.Allocator) ![]const u8 {
     const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
-    return std.fmt.allocPrint(allocator, "{s}/.local/share/zlice", .{home});
+    return std.fmt.allocPrint(allocator, "{s}/.local/share/zplit", .{home});
 }
 
 /// Build the full path for a session file.
@@ -100,7 +100,7 @@ fn buildJson(allocator: std.mem.Allocator, tab_manager: *tab_mod.TabManager) ![]
 
 // ─── Save ─────────────────────────────────────────────────────────────────────
 
-/// Save a session layout to `~/.local/share/zlice/{name}.json`.
+/// Save a session layout to `~/.local/share/zplit/{name}.json`.
 pub fn saveSession(allocator: std.mem.Allocator, name: []const u8, tab_manager: *tab_mod.TabManager) !void {
     const data_dir = try getDataDir(allocator);
     defer allocator.free(data_dir);
@@ -124,7 +124,7 @@ pub fn saveSession(allocator: std.mem.Allocator, name: []const u8, tab_manager: 
 
 // ─── Load ─────────────────────────────────────────────────────────────────────
 
-/// Load a session from `~/.local/share/zlice/{name}.json`.
+/// Load a session from `~/.local/share/zplit/{name}.json`.
 /// Returns null if the file does not exist.
 /// Caller must call `SavedSession.deinit()` on the returned value.
 pub fn loadSession(allocator: std.mem.Allocator, name: []const u8) !?SavedSession {
@@ -303,7 +303,7 @@ test "save and load round-trip" {
 
     // Use a path in /tmp that we can clean up.
     const ts = std.time.milliTimestamp();
-    const file_path = try std.fmt.allocPrint(allocator, "/tmp/zlice-test-{d}.json", .{ts});
+    const file_path = try std.fmt.allocPrint(allocator, "/tmp/zplit-test-{d}.json", .{ts});
     defer allocator.free(file_path);
     defer std.fs.deleteFileAbsolute(file_path) catch {};
 
@@ -326,7 +326,7 @@ test "save and load round-trip" {
 
 test "load nonexistent returns null" {
     const allocator = testing.allocator;
-    const result = try loadSessionFromPath(allocator, "/tmp/zlice-test-nonexistent-99999.json");
+    const result = try loadSessionFromPath(allocator, "/tmp/zplit-test-nonexistent-99999.json");
     try testing.expectEqual(@as(?SavedSession, null), result);
 }
 
@@ -334,7 +334,7 @@ test "delete removes file" {
     const allocator = testing.allocator;
 
     const ts = std.time.milliTimestamp();
-    const file_path = try std.fmt.allocPrint(allocator, "/tmp/zlice-del-test-{d}.json", .{ts});
+    const file_path = try std.fmt.allocPrint(allocator, "/tmp/zplit-del-test-{d}.json", .{ts});
     defer allocator.free(file_path);
 
     // Create a dummy file.

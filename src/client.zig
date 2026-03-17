@@ -405,7 +405,7 @@ fn handleServerFrame(
             const err_info = protocol.decodeError(payload) catch return true;
             // Display the error message in the terminal (best effort).
             var err_buf: [256]u8 = undefined;
-            const err_msg = std.fmt.bufPrint(&err_buf, "\r\n[zlice error {d}]: {s}\r\n", .{ err_info.code, err_info.msg }) catch &err_buf;
+            const err_msg = std.fmt.bufPrint(&err_buf, "\r\n[zplit error {d}]: {s}\r\n", .{ err_info.code, err_info.msg }) catch &err_buf;
             _ = posix.write(posix.STDERR_FILENO, err_msg) catch {};
         },
 
