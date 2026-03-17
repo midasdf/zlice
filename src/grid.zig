@@ -109,12 +109,25 @@ pub const Grid = struct {
 
     /// Get a cell at a specific viewport position. Returns blank cell if out of bounds.
     /// Get a cell from the visible viewport. Row 0 is the top of the viewport.
+    /// scroll_back: number of lines scrolled back from live view (0 = live).
     pub fn getCell(self: *const Grid, row: u16, col: u16) Cell {
+        return self.getCellScrolled(row, col, 0);
+    }
+
+    pub fn getCellScrolled(self: *const Grid, row: u16, col: u16, scroll_back: u16) Cell {
         const idx = self.absRow(row);
-        if (idx >= self.rows.items.len or col >= self.cols) return Cell{};
-        const r = self.rows.items[idx];
+        // Scroll back: move the viewport up by scroll_back lines
+        const scrolled_idx = if (idx >= scroll_back) idx - scroll_back else return Cell{};
+        if (scrolled_idx >= self.rows.items.len or col >= self.cols) return Cell{};
+        const r = self.rows.items[scrolled_idx];
         if (col >= r.cells.len) return Cell{};
         return r.cells[col];
+    }
+
+    /// How many lines of scrollback are available above the viewport
+    pub fn scrollbackLen(self: *const Grid) usize {
+        const total = self.rows.items.len;
+        return if (total > self.viewport_rows) total - self.viewport_rows else 0;
     }
 
     pub fn getCols(self: *const Grid) u16 {

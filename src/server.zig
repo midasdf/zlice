@@ -380,7 +380,15 @@ pub const Server = struct {
             .state => {
                 // Client mode changed — update server-side mode for status bar
                 if (payload.len >= 1) {
-                    self.current_mode = std.meta.intToEnum(mode_mod.Mode, payload[0]) catch .normal;
+                    const new_mode = std.meta.intToEnum(mode_mod.Mode, payload[0]) catch .normal;
+                    // Reset scroll offset when leaving scroll mode
+                    if (self.current_mode == .scroll and new_mode != .scroll) {
+                        const at = self.tab_manager.activeTab();
+                        if (self.pane_states.get(at.pane_tree.active_pane)) |state| {
+                            state.scroll_offset = 0;
+                        }
+                    }
+                    self.current_mode = new_mode;
                     self.compose();
                 }
             },
@@ -489,19 +497,21 @@ pub const Server = struct {
             },
             .scroll_up_lines => {
                 if (self.pane_states.get(active_id)) |state| {
-                    state.scroll_offset +|= 3;
+                    const max: u16 = @intCast(@min(state.grid.scrollbackLen(), std.math.maxInt(u16)));
+                    state.scroll_offset = @min(state.scroll_offset +| 1, max);
                     self.compose();
                 }
             },
             .scroll_down_lines => {
                 if (self.pane_states.get(active_id)) |state| {
-                    state.scroll_offset -|= 3;
+                    state.scroll_offset -|= 1;
                     self.compose();
                 }
             },
             .scroll_half_page_up => {
                 if (self.pane_states.get(active_id)) |state| {
-                    state.scroll_offset +|= state.grid.viewport_rows / 2;
+                    const max: u16 = @intCast(@min(state.grid.scrollbackLen(), std.math.maxInt(u16)));
+                    state.scroll_offset = @min(state.scroll_offset +| (state.grid.viewport_rows / 2), max);
                     self.compose();
                 }
             },
@@ -740,7 +750,10 @@ pub const Server = struct {
                     const screen_col = inner_col + c;
                     if (screen_col >= self.screen.cols) break;
 
-                    const vt_cell = pane_state.grid.getCell(r, c);
+                    // Apply scroll offset: clamp to available scrollback
+                    const max_scroll: u16 = @intCast(@min(pane_state.grid.scrollbackLen(), std.math.maxInt(u16)));
+                    const eff_scroll = @min(pane_state.scroll_offset, max_scroll);
+                    const vt_cell = pane_state.grid.getCellScrolled(r, c, eff_scroll);
 
                     const screen_cell = self.screen.cellAt(screen_row, screen_col);
                     screen_cell.* = render_mod.Cell{
