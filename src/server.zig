@@ -544,7 +544,13 @@ pub const Server = struct {
                 } else if (isPtyTag(tag)) {
                     // PTY output for a pane
                     const pane_id = paneIdFromTag(tag);
+                    const is_hup = (ev.events & (linux.EPOLL.HUP | linux.EPOLL.ERR)) != 0;
+                    // Read any remaining output first
                     self.handlePtyOutput(pane_id);
+                    // If HUP/ERR or read returned 0, close the pane
+                    if (is_hup) {
+                        self.closePaneById(pane_id);
+                    }
                 }
             }
         }
@@ -793,13 +799,41 @@ pub const Server = struct {
         self.allocator.destroy(s);
     }
 
+    // ── closePaneById ──────────────────────────────────────────────────────────
+
+    fn closePaneById(self: *Server, pane_id: pane_mod.PaneId) void {
+        const active_tab = self.tab_manager.activeTab();
+        const was_active = (active_tab.pane_tree.active_pane == pane_id);
+
+        // Try to close in the pane tree — returns sibling or null if last pane
+        if (active_tab.pane_tree.closePane(pane_id)) |sibling| {
+            self.destroyPaneState(pane_id);
+            if (was_active) {
+                active_tab.pane_tree.active_pane = sibling;
+            }
+            self.compose();
+        } else {
+            // Last pane in tab — close the tab or keep it empty
+            self.destroyPaneState(pane_id);
+            if (self.tab_manager.tabCount() > 1) {
+                _ = self.tab_manager.closeTab(self.tab_manager.active);
+                self.compose();
+            } else {
+                // Last tab, last pane — quit
+                self.running = false;
+            }
+        }
+    }
+
     // ── handlePtyOutput ───────────────────────────────────────────────────────
 
     fn handlePtyOutput(self: *Server, pane_id: pane_mod.PaneId) void {
         const state = self.pane_states.get(pane_id) orelse return;
         var buf: [4096]u8 = undefined;
-        const n = state.pty.read(&buf) catch return;
-        if (n == 0) return;
+        const n = state.pty.read(&buf) catch {
+            return; // Error reading — HUP handler will clean up
+        };
+        if (n == 0) return; // No data yet — HUP handler will clean up if EOF
 
         // Debug: dump first PTY output
         {
