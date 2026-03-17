@@ -94,9 +94,14 @@ pub const Grid = struct {
     }
 
     /// Get a cell at a specific viewport position. Returns blank cell if out of bounds.
+    /// Get a cell from the visible viewport. Row 0 is the top of the viewport.
+    /// When rows.len > viewport_rows, the viewport is the last viewport_rows rows.
     pub fn getCell(self: *const Grid, row: u16, col: u16) Cell {
-        if (row >= self.rows.items.len or col >= self.cols) return Cell{};
-        const r = self.rows.items[row];
+        const total: u16 = @intCast(self.rows.items.len);
+        const viewport_start = if (total > self.viewport_rows) total - self.viewport_rows else 0;
+        const actual_row = viewport_start + row;
+        if (actual_row >= self.rows.items.len or col >= self.cols) return Cell{};
+        const r = self.rows.items[actual_row];
         if (col >= r.cells.len) return Cell{};
         return r.cells[col];
     }
@@ -561,17 +566,15 @@ pub const Grid = struct {
                     break;
                 }
             }
-            // If still too many, remove from top
+            // If still too many rows, keep them but adjust viewport
+            // The viewport shows the last new_rows rows (where cursor is)
             if (self.rows.items.len > new_rows) {
-                const excess = self.rows.items.len - new_rows;
-                if (new_cursor_row < excess) {
-                    new_cursor_row = 0;
-                } else {
-                    new_cursor_row -= @intCast(excess);
+                // Ensure cursor is within the visible viewport at the bottom
+                const total: u16 = @intCast(self.rows.items.len);
+                const viewport_start = total -| new_rows;
+                if (new_cursor_row < viewport_start) {
+                    new_cursor_row = viewport_start;
                 }
-                for (self.rows.items[0..excess]) |*r| r.deinit(alloc);
-                std.mem.copyForwards(Row, self.rows.items[0..new_rows], self.rows.items[excess..]);
-                self.rows.shrinkRetainingCapacity(new_rows);
             }
         }
 
