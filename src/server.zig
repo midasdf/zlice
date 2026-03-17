@@ -565,6 +565,7 @@ pub const Server = struct {
                 self.client_cols = hp.cols;
                 self.client_rows = hp.rows;
                 self.screen.resize(hp.cols, hp.rows) catch {};
+                self.screen.invalidate();
                 self.compose();
             },
             .input => {
@@ -586,6 +587,8 @@ pub const Server = struct {
                 self.client_cols = rp.cols;
                 self.client_rows = rp.rows;
                 self.screen.resize(rp.cols, rp.rows) catch {};
+                // Invalidate front buffer so full screen is redrawn
+                self.screen.invalidate();
                 // compose() handles per-pane PTY resize dynamically
                 self.compose();
             },
@@ -918,7 +921,16 @@ pub const Server = struct {
             const new_cols = if (rgn.cols > 2) rgn.cols - 2 else 1;
             const new_rows = if (rgn.rows > 2) rgn.rows - 2 else 1;
             if (pane_state.cols != new_cols or pane_state.rows != new_rows) {
-                // Resize PTY — this sends SIGWINCH to the child
+                {
+                    const log_fd = std.posix.open("/tmp/zlice-resize.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch null;
+                    if (log_fd) |fd| {
+                        defer std.posix.close(fd);
+                        var dbuf: [128]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&dbuf, "RESIZE pane {}: {}x{} -> {}x{}\n", .{ entry.id, pane_state.cols, pane_state.rows, new_cols, new_rows }) catch "";
+                        _ = std.posix.write(fd, msg) catch {};
+                    }
+                }
+                // Resize PTY — kernel sends SIGWINCH to child
                 pane_state.pty.setSize(new_cols, new_rows) catch {};
                 // Reallocate screen buffer
                 const new_len = @as(usize, new_cols) * @as(usize, new_rows);
@@ -932,12 +944,8 @@ pub const Server = struct {
                 pane_state.screen = new_screen;
                 pane_state.cols = new_cols;
                 pane_state.rows = new_rows;
-                // Place cursor at bottom-left where shell prompt typically redraws
-                pane_state.cursor_row = new_rows -| 1;
-                pane_state.cursor_col = 0;
-                // Ask child to redraw by sending "clear screen" via PTY
-                // This makes readline/fish redraw their prompt at the new width
-                _ = pane_state.pty.write("\x0c") catch {}; // Ctrl+L = clear/redraw
+                pane_state.cursor_row = @min(pane_state.cursor_row, new_rows -| 1);
+                pane_state.cursor_col = @min(pane_state.cursor_col, new_cols -| 1);
             }
         }
 

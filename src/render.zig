@@ -191,6 +191,13 @@ pub const Screen = struct {
         @memcpy(self.front, self.back);
     }
 
+    /// Invalidate front buffer so next getDirtyRegions returns everything as dirty.
+    pub fn invalidate(self: *Screen) void {
+        // Fill front with a character that will never match any real cell
+        const invalid = Cell{ .char = 0xFFFD, .fg = .{ .idx = 255 }, .bg = .{ .idx = 255 } };
+        @memset(self.front, invalid);
+    }
+
     /// Compare front and back buffers row by row.
     /// Returns a slice of DirtyRegion for each contiguous run of changed cells.
     /// Caller owns the returned slice AND each region's cells slice.
