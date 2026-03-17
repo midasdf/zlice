@@ -107,8 +107,8 @@ pub const ModeState = struct {
             // Pane management
             .x => return .{ .send_command = .close_pane },
             .f => return .{ .send_command = .toggle_fullscreen },
-            // Return to normal
-            .escape, .enter => {
+            // Return to normal (Ctrl+P also exits pane mode, like zellij)
+            .escape, .enter, .ctrl_p => {
                 self.current = .normal;
                 return .{ .switch_mode = .normal };
             },
@@ -125,7 +125,7 @@ pub const ModeState = struct {
             .n => return .{ .send_command = .new_tab },
             .x => return .{ .send_command = .close_tab },
             .r => return .start_rename_tab,
-            .escape, .enter => {
+            .escape, .enter, .ctrl_t => {
                 self.current = .normal;
                 return .{ .switch_mode = .normal };
             },
@@ -141,7 +141,7 @@ pub const ModeState = struct {
             .k, .arrow_up => return .{ .send_command = .scroll_up_lines },
             .d, .page_down => return .{ .send_command = .scroll_half_page_down },
             .u, .page_up => return .{ .send_command = .scroll_half_page_up },
-            .escape, .enter => {
+            .escape, .enter, .ctrl_s => {
                 self.current = .normal;
                 return .{ .switch_mode = .normal };
             },
@@ -155,7 +155,7 @@ pub const ModeState = struct {
         switch (key) {
             .d => return .{ .send_command = .detach },
             .q => return .{ .send_command = .quit },
-            .escape, .enter => {
+            .escape, .enter, .ctrl_o => {
                 self.current = .normal;
                 return .{ .switch_mode = .normal };
             },
