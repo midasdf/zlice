@@ -834,6 +834,41 @@ pub const Server = struct {
         const regions = active_tab.pane_tree.calculateRegions(total_region) catch return;
         defer self.allocator.free(regions);
 
+        // Resize each pane's PTY and screen buffer to match its actual region
+        for (regions) |entry| {
+            const pane_state = self.pane_states.get(entry.id) orelse continue;
+            const rgn = entry.region;
+            // Inner content area (minus border)
+            const new_cols = if (rgn.cols > 2) rgn.cols - 2 else 1;
+            const new_rows = if (rgn.rows > 2) rgn.rows - 2 else 1;
+            if (pane_state.cols != new_cols or pane_state.rows != new_rows) {
+                pane_state.pty.setSize(new_cols, new_rows) catch {};
+                const new_len = @as(usize, new_cols) * @as(usize, new_rows);
+                const new_screen = self.allocator.alloc(vt_mod.Cell, new_len) catch continue;
+                // Copy what fits from old screen
+                const copy_rows = @min(pane_state.rows, new_rows);
+                const copy_cols = @min(pane_state.cols, new_cols);
+                var r: u16 = 0;
+                @memset(new_screen, vt_mod.Cell{});
+                while (r < copy_rows) : (r += 1) {
+                    const old_off = @as(usize, r) * pane_state.cols;
+                    const new_off = @as(usize, r) * new_cols;
+                    @memcpy(new_screen[new_off..][0..copy_cols], pane_state.screen[old_off..][0..copy_cols]);
+                }
+                // Free old alt screen buf if size changed
+                if (pane_state.alt_screen_buf) |buf| {
+                    self.allocator.free(buf);
+                    pane_state.alt_screen_buf = null;
+                }
+                self.allocator.free(pane_state.screen);
+                pane_state.screen = new_screen;
+                pane_state.cols = new_cols;
+                pane_state.rows = new_rows;
+                pane_state.cursor_row = @min(pane_state.cursor_row, new_rows -| 1);
+                pane_state.cursor_col = @min(pane_state.cursor_col, new_cols -| 1);
+            }
+        }
+
         // For each pane region, draw border with title and copy pane content inset by 1
         for (regions) |entry| {
             const pane_state = self.pane_states.get(entry.id) orelse continue;
