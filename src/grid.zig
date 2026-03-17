@@ -321,11 +321,30 @@ pub const Grid = struct {
                     if (self.saved_main_rows) |saved| {
                         for (self.rows.items) |*r| r.deinit(self.allocator);
                         self.rows.clearRetainingCapacity();
-                        for (saved) |r| {
-                            self.rows.append(self.allocator, r) catch {};
+                        var restore_failed = false;
+                        for (saved, 0..) |r, idx| {
+                            self.rows.append(self.allocator, r) catch {
+                                // OOM: deinit this row and all remaining saved rows
+                                var rr = r;
+                                rr.deinit(self.allocator);
+                                var j = idx + 1;
+                                while (j < saved.len) : (j += 1) {
+                                    var rem = saved[j];
+                                    rem.deinit(self.allocator);
+                                }
+                                restore_failed = true;
+                                break;
+                            };
                         }
                         self.allocator.free(saved);
                         self.saved_main_rows = null;
+                        if (restore_failed) {
+                            // Ensure at least one row exists
+                            if (self.rows.items.len == 0) {
+                                const blank = Row.init(self.allocator, self.cols, true) catch return null;
+                                self.rows.append(self.allocator, blank) catch return null;
+                            }
+                        }
                     }
                     self.cursor_row = self.saved_cursor_row;
                     self.cursor_col = self.saved_cursor_col;
@@ -366,9 +385,11 @@ pub const Grid = struct {
 
         i = 0;
         while (i < count) : (i += 1) {
-            self.rows.items[remaining + i] = Row.init(self.allocator, self.cols, true) catch Row{
-                .cells = &.{},
-                .is_canonical = true,
+            self.rows.items[remaining + i] = Row.init(self.allocator, self.cols, true) catch {
+                // On OOM, reuse the slot with a zero-width placeholder that won't be indexed
+                // This is a best-effort scenario under extreme memory pressure
+                self.rows.items.len = remaining + i;
+                return;
             };
         }
     }
