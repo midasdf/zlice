@@ -62,6 +62,20 @@ pub const Grid = struct {
     saved_cursor_col: u16 = 0,
     in_alt_screen: bool = false,
 
+    /// Convert viewport-relative row to absolute row index in self.rows
+    fn absRow(self: *const Grid, vp_row: u16) usize {
+        const total: usize = self.rows.items.len;
+        const vp_start = if (total > self.viewport_rows) total - self.viewport_rows else 0;
+        return vp_start + vp_row;
+    }
+
+    /// Get a mutable reference to a row by viewport-relative index
+    fn getRow(self: *Grid, vp_row: u16) ?*Row {
+        const idx = self.absRow(vp_row);
+        if (idx >= self.rows.items.len) return null;
+        return &self.rows.items[idx];
+    }
+
     pub fn init(allocator: std.mem.Allocator, cols: u16, viewport_rows: u16) !Grid {
         var rows: std.ArrayListUnmanaged(Row) = .{};
         errdefer {
@@ -95,13 +109,10 @@ pub const Grid = struct {
 
     /// Get a cell at a specific viewport position. Returns blank cell if out of bounds.
     /// Get a cell from the visible viewport. Row 0 is the top of the viewport.
-    /// When rows.len > viewport_rows, the viewport is the last viewport_rows rows.
     pub fn getCell(self: *const Grid, row: u16, col: u16) Cell {
-        const total: usize = self.rows.items.len;
-        const viewport_start: usize = if (total > self.viewport_rows) total - self.viewport_rows else 0;
-        const actual_row: usize = viewport_start + row;
-        if (actual_row >= total or col >= self.cols) return Cell{};
-        const r = self.rows.items[actual_row];
+        const idx = self.absRow(row);
+        if (idx >= self.rows.items.len or col >= self.cols) return Cell{};
+        const r = self.rows.items[idx];
         if (col >= r.cells.len) return Cell{};
         return r.cells[col];
     }
@@ -120,50 +131,50 @@ pub const Grid = struct {
     pub fn applyEvent(self: *Grid, ev: vt.Event) ?CprResponse {
         switch (ev) {
             .print => |ch| {
-                if (self.cursor_row >= self.rows.items.len) return null;
                 // Auto-wrap: if cursor is at right margin, wrap to next line
                 if (self.cursor_col >= self.cols) {
                     self.cursor_col = 0;
                     self.cursor_row +|= 1;
-                    if (self.cursor_row >= self.rows.items.len) {
-                        self.cursor_row = @intCast(self.rows.items.len - 1);
+                    if (self.cursor_row >= self.viewport_rows) {
+                        self.cursor_row = self.viewport_rows - 1;
                         self.scrollUp(1);
                     }
                     // Mark this new row as wrapped (non-canonical)
-                    if (self.cursor_row < self.rows.items.len) {
-                        self.rows.items[self.cursor_row].is_canonical = false;
+                    if (self.getRow(self.cursor_row)) |rr| {
+                        rr.is_canonical = false;
                     }
                 }
-                const r = &self.rows.items[self.cursor_row];
-                if (self.cursor_col < r.cells.len) {
-                    r.cells[self.cursor_col] = .{
-                        .char = ch,
-                        .fg = self.pen_fg,
-                        .bg = self.pen_bg,
-                        .attr = self.pen_attr,
-                    };
+                if (self.getRow(self.cursor_row)) |r| {
+                    if (self.cursor_col < r.cells.len) {
+                        r.cells[self.cursor_col] = .{
+                            .char = ch,
+                            .fg = self.pen_fg,
+                            .bg = self.pen_bg,
+                            .attr = self.pen_attr,
+                        };
+                    }
                 }
                 self.cursor_col += 1;
             },
             .cursor_pos => |cp| {
-                self.cursor_row = @min(cp.row, @as(u16, @intCast(self.rows.items.len)) -| 1);
+                self.cursor_row = @min(cp.row, self.viewport_rows -| 1);
                 self.cursor_col = @min(cp.col, self.cols -| 1);
             },
             .cursor_move => |cm| {
                 const new_row: i32 = @as(i32, self.cursor_row) + cm.row;
                 const new_col: i32 = @as(i32, self.cursor_col) + cm.col;
-                self.cursor_row = @intCast(@max(0, @min(new_row, @as(i32, @intCast(self.rows.items.len)) - 1)));
+                self.cursor_row = @intCast(@max(0, @min(new_row, @as(i32, self.viewport_rows) - 1)));
                 self.cursor_col = @intCast(@max(0, @min(new_col, @as(i32, self.cols) - 1)));
             },
             .linefeed => {
                 self.cursor_row +|= 1;
-                if (self.cursor_row >= self.rows.items.len) {
-                    self.cursor_row = @intCast(self.rows.items.len - 1);
+                if (self.cursor_row >= self.viewport_rows) {
+                    self.cursor_row = self.viewport_rows - 1;
                     self.scrollUp(1);
                 }
                 // The row we landed on after a linefeed is canonical
-                if (self.cursor_row < self.rows.items.len) {
-                    self.rows.items[self.cursor_row].is_canonical = true;
+                if (self.getRow(self.cursor_row)) |rr| {
+                    rr.is_canonical = true;
                 }
             },
             .carriage_return => {
@@ -175,40 +186,56 @@ pub const Grid = struct {
             .erase_display => |mode| {
                 switch (mode) {
                     0 => {
-                        if (self.cursor_row < self.rows.items.len) {
-                            const r = &self.rows.items[self.cursor_row];
+                        // Erase from cursor to end of viewport
+                        if (self.getRow(self.cursor_row)) |r| {
                             if (self.cursor_col < r.cells.len) {
                                 @memset(r.cells[self.cursor_col..], Cell{});
                             }
                         }
-                        var i: usize = self.cursor_row + 1;
-                        while (i < self.rows.items.len) : (i += 1) {
-                            @memset(self.rows.items[i].cells, Cell{});
+                        var vp_i: u16 = self.cursor_row + 1;
+                        while (vp_i < self.viewport_rows) : (vp_i += 1) {
+                            if (self.getRow(vp_i)) |r| {
+                                @memset(r.cells, Cell{});
+                            }
                         }
                     },
                     1 => {
-                        var i: usize = 0;
-                        while (i < self.cursor_row) : (i += 1) {
-                            @memset(self.rows.items[i].cells, Cell{});
+                        // Erase from top of viewport to cursor
+                        var vp_i: u16 = 0;
+                        while (vp_i < self.cursor_row) : (vp_i += 1) {
+                            if (self.getRow(vp_i)) |r| {
+                                @memset(r.cells, Cell{});
+                            }
                         }
-                        if (self.cursor_row < self.rows.items.len) {
-                            const r = &self.rows.items[self.cursor_row];
+                        if (self.getRow(self.cursor_row)) |r| {
                             const end = @min(@as(usize, self.cursor_col) + 1, r.cells.len);
                             @memset(r.cells[0..end], Cell{});
                         }
                     },
                     2 => {
-                        // Clear all visible rows
-                        for (self.rows.items) |*r| {
-                            @memset(r.cells, Cell{});
+                        if (self.in_alt_screen) {
+                            // Alt screen: clear all rows in place
+                            for (self.rows.items) |*r| {
+                                @memset(r.cells, Cell{});
+                            }
+                        } else {
+                            // Main screen: append new blank rows to preserve scrollback
+                            var i: u16 = 0;
+                            while (i < self.viewport_rows) : (i += 1) {
+                                var new_row = Row.init(self.allocator, self.cols, true) catch break;
+                                self.rows.append(self.allocator, new_row) catch {
+                                    new_row.deinit(self.allocator);
+                                    break;
+                                };
+                            }
+                            self.cursor_row = 0;
                         }
                     },
                     else => {},
                 }
             },
             .erase_line => |mode| {
-                if (self.cursor_row >= self.rows.items.len) return null;
-                const r = &self.rows.items[self.cursor_row];
+                const r = self.getRow(self.cursor_row) orelse return null;
                 switch (mode) {
                     0 => {
                         if (self.cursor_col < r.cells.len) {
@@ -228,48 +255,63 @@ pub const Grid = struct {
             .scroll_up => |n| self.scrollUp(n),
             .scroll_down => |n| self.scrollDown(n),
             .insert_lines => |n| {
-                const max_row: u16 = @intCast(self.rows.items.len);
-                const count = @min(n, max_row - self.cursor_row);
+                // insert_lines operates within the viewport only
+                const vp_rows = self.viewport_rows;
+                const count = @min(n, vp_rows - self.cursor_row);
                 if (count == 0) return null;
-                var dst_row_i: isize = @as(isize, max_row) - 1;
+                // Shift rows down within viewport: start from bottom of viewport
+                var dst_vp: isize = @as(isize, vp_rows) - 1;
                 const count_i: isize = @intCast(count);
-                while (dst_row_i >= @as(isize, self.cursor_row) + count_i) : (dst_row_i -= 1) {
-                    const src_idx: usize = @intCast(dst_row_i - count_i);
-                    const dst_idx: usize = @intCast(dst_row_i);
-                    const tmp = self.rows.items[dst_idx].cells;
-                    self.rows.items[dst_idx].cells = self.rows.items[src_idx].cells;
-                    self.rows.items[src_idx].cells = tmp;
-                    self.rows.items[dst_idx].is_canonical = self.rows.items[src_idx].is_canonical;
+                while (dst_vp >= @as(isize, self.cursor_row) + count_i) : (dst_vp -= 1) {
+                    const src_vp: u16 = @intCast(dst_vp - count_i);
+                    const dst_vp_u: u16 = @intCast(dst_vp);
+                    const src_abs = self.absRow(src_vp);
+                    const dst_abs = self.absRow(dst_vp_u);
+                    if (src_abs < self.rows.items.len and dst_abs < self.rows.items.len) {
+                        const tmp = self.rows.items[dst_abs].cells;
+                        self.rows.items[dst_abs].cells = self.rows.items[src_abs].cells;
+                        self.rows.items[src_abs].cells = tmp;
+                        self.rows.items[dst_abs].is_canonical = self.rows.items[src_abs].is_canonical;
+                    }
                 }
+                // Clear the inserted rows
                 var i: u16 = 0;
                 while (i < count) : (i += 1) {
-                    const idx = self.cursor_row + i;
-                    if (idx < self.rows.items.len) {
-                        @memset(self.rows.items[idx].cells, Cell{});
-                        self.rows.items[idx].is_canonical = true;
+                    const vp_idx: u16 = self.cursor_row + i;
+                    if (self.getRow(vp_idx)) |r| {
+                        @memset(r.cells, Cell{});
+                        r.is_canonical = true;
                     }
                 }
             },
             .delete_lines => |n| {
-                const max_row: u16 = @intCast(self.rows.items.len);
-                const count = @min(n, max_row - self.cursor_row);
+                // delete_lines operates within the viewport only
+                const vp_rows = self.viewport_rows;
+                const count = @min(n, vp_rows - self.cursor_row);
                 if (count == 0) return null;
-                const move_rows = max_row - self.cursor_row - count;
+                const move_rows = vp_rows - self.cursor_row - count;
                 if (move_rows > 0) {
                     var i: u16 = 0;
                     while (i < move_rows) : (i += 1) {
-                        const src_idx: usize = self.cursor_row + count + i;
-                        const dst_idx: usize = self.cursor_row + i;
-                        const tmp = self.rows.items[dst_idx].cells;
-                        self.rows.items[dst_idx].cells = self.rows.items[src_idx].cells;
-                        self.rows.items[src_idx].cells = tmp;
-                        self.rows.items[dst_idx].is_canonical = self.rows.items[src_idx].is_canonical;
+                        const src_vp: u16 = self.cursor_row + count + i;
+                        const dst_vp: u16 = self.cursor_row + i;
+                        const src_abs = self.absRow(src_vp);
+                        const dst_abs = self.absRow(dst_vp);
+                        if (src_abs < self.rows.items.len and dst_abs < self.rows.items.len) {
+                            const tmp = self.rows.items[dst_abs].cells;
+                            self.rows.items[dst_abs].cells = self.rows.items[src_abs].cells;
+                            self.rows.items[src_abs].cells = tmp;
+                            self.rows.items[dst_abs].is_canonical = self.rows.items[src_abs].is_canonical;
+                        }
                     }
                 }
-                var i: u16 = max_row - count;
-                while (i < max_row) : (i += 1) {
-                    @memset(self.rows.items[i].cells, Cell{});
-                    self.rows.items[i].is_canonical = true;
+                // Clear rows at the bottom of the viewport
+                var i: u16 = vp_rows - count;
+                while (i < vp_rows) : (i += 1) {
+                    if (self.getRow(i)) |r| {
+                        @memset(r.cells, Cell{});
+                        r.is_canonical = true;
+                    }
                 }
             },
             .sgr => |params| {
@@ -375,54 +417,72 @@ pub const Grid = struct {
     // ── Scroll helpers ───────────────────────────────────────────────────────
 
     fn scrollUp(self: *Grid, n: u16) void {
-        const total: u16 = @intCast(self.rows.items.len);
-        const count = @min(n, total);
+        const total = self.rows.items.len;
+        // vp_start is the absolute index of the first viewport row
+        const vp_start: usize = if (total > self.viewport_rows) total - self.viewport_rows else 0;
+        const vp_len: usize = total - vp_start; // should equal viewport_rows when total >= viewport_rows
+        const count: usize = @min(@as(usize, n), vp_len);
         if (count == 0) return;
 
-        var i: u16 = 0;
-        while (i < count) : (i += 1) {
-            self.rows.items[i].deinit(self.allocator);
-        }
-
-        const remaining = total - count;
-        if (remaining > 0) {
-            std.mem.copyForwards(Row, self.rows.items[0..remaining], self.rows.items[count..total]);
-        }
-
-        i = 0;
-        while (i < count) : (i += 1) {
-            self.rows.items[remaining + i] = Row.init(self.allocator, self.cols, true) catch {
-                // On OOM, reuse the slot with a zero-width placeholder that won't be indexed
-                // This is a best-effort scenario under extreme memory pressure
-                self.rows.items.len = remaining + i;
-                return;
-            };
+        if (self.in_alt_screen) {
+            // Alt screen: discard the top viewport rows (shift them out of the array)
+            var i: usize = vp_start;
+            while (i < vp_start + count) : (i += 1) {
+                self.rows.items[i].deinit(self.allocator);
+            }
+            const remaining = total - vp_start - count;
+            if (remaining > 0) {
+                std.mem.copyForwards(Row, self.rows.items[vp_start .. vp_start + remaining], self.rows.items[vp_start + count .. total]);
+            }
+            var j: usize = 0;
+            while (j < count) : (j += 1) {
+                const idx = vp_start + remaining + j;
+                self.rows.items[idx] = Row.init(self.allocator, self.cols, true) catch {
+                    self.rows.items.len = vp_start + remaining + j;
+                    return;
+                };
+            }
+        } else {
+            // Main screen: append new blank rows (old rows become scrollback above viewport)
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                var new_row = Row.init(self.allocator, self.cols, true) catch return;
+                self.rows.append(self.allocator, new_row) catch {
+                    new_row.deinit(self.allocator);
+                    return;
+                };
+            }
         }
     }
 
     fn scrollDown(self: *Grid, n: u16) void {
-        const total: u16 = @intCast(self.rows.items.len);
-        const count = @min(n, total);
+        const total = self.rows.items.len;
+        const vp_start: usize = if (total > self.viewport_rows) total - self.viewport_rows else 0;
+        const vp_len: usize = total - vp_start;
+        const count: usize = @min(@as(usize, n), vp_len);
         if (count == 0) return;
 
-        var i: u16 = 0;
+        // scrollDown moves content down within the viewport; top rows get blanked.
+        // Shift rows within the viewport downward (bottom rows are discarded, top rows are blanked).
+        var i: usize = 0;
         while (i < count) : (i += 1) {
-            self.rows.items[total - 1 - i].deinit(self.allocator);
+            // Deinit the bottom viewport row that will be pushed off
+            self.rows.items[vp_start + vp_len - 1 - i].deinit(self.allocator);
         }
-
-        const remaining = total - count;
+        // Shift remaining viewport rows down by count
+        const remaining = vp_len - count;
         if (remaining > 0) {
-            var j: isize = @as(isize, remaining) - 1;
+            var j: isize = @as(isize, @intCast(remaining)) - 1;
             while (j >= 0) : (j -= 1) {
-                const src: usize = @intCast(j);
-                const dst: usize = @intCast(j + @as(isize, count));
+                const src: usize = vp_start + @as(usize, @intCast(j));
+                const dst: usize = vp_start + @as(usize, @intCast(j)) + count;
                 self.rows.items[dst] = self.rows.items[src];
             }
         }
-
+        // Blank the top viewport rows
         i = 0;
         while (i < count) : (i += 1) {
-            self.rows.items[i] = Row.init(self.allocator, self.cols, true) catch Row{
+            self.rows.items[vp_start + i] = Row.init(self.allocator, self.cols, true) catch Row{
                 .cells = &.{},
                 .is_canonical = true,
             };

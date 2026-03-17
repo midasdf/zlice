@@ -986,8 +986,7 @@ test "PaneState applyEvent erase_display 2" {
     const cols: u16 = 10;
     const rows: u16 = 5;
 
-    var grid = try grid_mod.Grid.init(allocator, cols, rows);
-    defer grid.deinit();
+    const grid = try grid_mod.Grid.init(allocator, cols, rows);
 
     // Fill with non-blank cells
     for (grid.rows.items) |*r| {
@@ -1004,6 +1003,7 @@ test "PaneState applyEvent erase_display 2" {
         .scrollback = sb,
         .grid = grid,
     };
+    defer state.grid.deinit();
 
     state.applyEvent(.{ .erase_display = 2 });
 
