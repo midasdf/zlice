@@ -5,44 +5,40 @@
 Written in Zig. Zero dependencies. Statically linked. Light enough to run where others won't.
 
 ```
-┌ fish ─────────────────────────────┐┌ vim ──────────────────────────────┐
-│ ~/projects/zlice $ zig build      ││  1│ const std = @import("std");   │
-│ Build succeeded                   ││  2│                               │
-│ ~/projects/zlice $ _              ││  3│ pub fn main() !void {         │
-│                                   ││~ ~                               │
-├ logs ─────────────────────────────┤│                                   │
-│ [2026-03-17] all tests passed     ││                                   │
-│ ~/projects/zlice $                ││                                   │
-└───────────────────────────────────┘└───────────────────────────────────┘
- Tab 1 [*]  Tab 2                    NORMAL  Ctrl+p:Pane | Ctrl+t:Tab
+ Tab 1    Tab 2
+┌ fish ──────────────────────┐┌ vim ─────────────────────────┐
+│ $ zig build                ││  1│ const std = @import(..); │
+│ Build succeeded            ││  2│                          │
+│ $ _                        ││  3│ pub fn main() !void {    │
+│                            ││  ~                           │
+└────────────────────────────┘└─────────────────────────────┘
+ NORMAL  Ctrl+p → Pane | Ctrl+t → Tab | Ctrl+s → Scroll
 ```
 
 ## Why
 
-Measured on Raspberry Pi Zero 2W (aarch64), March 2026:
+Measured on Raspberry Pi Zero 2W (aarch64, Arch Linux ARM), March 2026:
 
 | | zlice | tmux 3.6a | zellij 0.43.1 |
 |---|---|---|---|
-| Binary | **93 KB** | 1.3 MB installed | 44 MB installed |
+| Binary | **91 KB** | 1.3 MB | 44 MB |
 | Language | Zig | C | Rust + WASM |
-| Runtime deps | **0** | libevent, ncurses | many |
-| RSS (idle) | **~1 MB** | ~3 MB | ~40 MB |
+| Runtime deps | **0** | libevent, ncurses, etc. | curl, glibc, zlib, etc. |
 | Text reflow | Yes | No | Yes |
 | CJK width | Yes | Yes | Yes |
 
-> Binary = static aarch64 `ReleaseSmall`. RSS = resident set of server process with one pane.
-> tmux installed size from `pacman -Qi`. zellij binary `/usr/bin/zellij` = 44 MB.
+> zlice binary = static aarch64 `ReleaseSmall` (92,848 bytes). tmux/zellij = installed size from `pacman -Si`/`pacman -Qi` on aarch64.
 
 ## Features
 
 - **Pane splitting** — horizontal, vertical, resize, focus navigation
-- **Tabs** — create, close, switch, rename
-- **Session persistence** — detach/attach, layout save/restore
+- **Tabs** — create, close, switch
+- **Detach/attach** — disconnect and reconnect to running sessions
 - **Zellij-style modes** — NORMAL, PANE, TAB, SCROLL, SESSION, LOCKED
 - **Text reflow** — content reflows when terminal width changes
 - **Scrollback** — preserved on screen clear, scroll mode to browse history
 - **CJK support** — fullwidth characters, Japanese input (fcitx5)
-- **VT220 compatible** — SGR colors (256 + RGB), alternate screen, DA1/DSR
+- **Terminal emulation** — SGR colors (256 + RGB), alternate screen, DA1/DSR
 - **Alternate screen** — vim, htop, etc. restore correctly on exit
 - **Single binary** — client/server in one executable, zero runtime dependencies
 
@@ -89,7 +85,7 @@ All modes return to NORMAL with `Esc` or `Enter`.
 `h/j/k/l` focus | `H/J/K/L` resize | `n` split-h | `v` split-v | `x` close
 
 **TAB mode:**
-`h/l` switch | `n` new | `x` close | `r` rename
+`h/l` switch | `n` new | `x` close
 
 **SCROLL mode:**
 `j/k` line | `u/d` half-page | `PageUp/PageDown`
