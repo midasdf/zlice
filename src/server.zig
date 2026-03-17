@@ -5,6 +5,7 @@ const protocol = @import("protocol.zig");
 const pty_mod = @import("pty.zig");
 const vt_mod = @import("vt.zig");
 const scrollback_mod = @import("scrollback.zig");
+const grid_mod = @import("grid.zig");
 const pane_mod = @import("pane.zig");
 const tab_mod = @import("tab.zig");
 const render_mod = @import("render.zig");
@@ -43,256 +44,36 @@ const DEFAULT_ROWS: u16 = 24;
 
 // ─── PaneState ────────────────────────────────────────────────────────────────
 
-/// Per-pane runtime state (PTY + VT parser + scrollback + virtual screen).
+/// Per-pane runtime state (PTY + VT parser + scrollback + grid screen).
 pub const PaneState = struct {
     allocator: std.mem.Allocator,
     pty: pty_mod.Pty,
     vt_parser: vt_mod.Parser,
     scrollback: scrollback_mod.Scrollback,
-    /// Pane's virtual screen buffer: rows * cols cells (what the PTY has drawn).
-    screen: []vt_mod.Cell,
-    cursor_row: u16 = 0,
-    cursor_col: u16 = 0,
-    cols: u16,
-    rows: u16,
+    grid: grid_mod.Grid,
     scroll_offset: u16 = 0, // lines scrolled back from live view
     /// Pane title (set by OSC set_title VT sequence or defaulted to "Pane N").
     title: [64]u8 = [_]u8{0} ** 64,
     title_len: u8 = 0,
-    /// Current drawing pen (SGR state)
-    pen_fg: vt_mod.Color = .default,
-    pen_bg: vt_mod.Color = .default,
-    pen_attr: vt_mod.Attr = .{},
-    /// Alternate screen buffer support
-    alt_screen_buf: ?[]vt_mod.Cell = null,
-    saved_cursor_row: u16 = 0,
-    saved_cursor_col: u16 = 0,
-    in_alt_screen: bool = false,
 
-    /// Apply a VT event to this pane's screen buffer.
+    /// Apply a VT event — delegates to grid; handles set_title and CPR locally.
     pub fn applyEvent(self: *PaneState, ev: vt_mod.Event) void {
         switch (ev) {
-            .print => |ch| {
-                if (self.cursor_row >= self.rows or self.cursor_col >= self.cols) return;
-                const idx = @as(usize, self.cursor_row) * self.cols + self.cursor_col;
-                self.screen[idx] = .{
-                    .char = ch,
-                    .fg = self.pen_fg,
-                    .bg = self.pen_bg,
-                    .attr = self.pen_attr,
-                };
-                self.cursor_col += 1;
-                if (self.cursor_col >= self.cols) {
-                    self.cursor_col = 0;
-                    self.cursor_row +|= 1;
-                    if (self.cursor_row >= self.rows) {
-                        self.cursor_row = self.rows - 1;
-                        self.scrollScreenUp(1);
-                    }
-                }
-            },
-            .cursor_pos => |cp| {
-                self.cursor_row = @min(cp.row, self.rows -| 1);
-                self.cursor_col = @min(cp.col, self.cols -| 1);
-            },
-            .cursor_move => |cm| {
-                const new_row: i32 = @as(i32, self.cursor_row) + cm.row;
-                const new_col: i32 = @as(i32, self.cursor_col) + cm.col;
-                self.cursor_row = @intCast(@max(0, @min(new_row, @as(i32, self.rows) - 1)));
-                self.cursor_col = @intCast(@max(0, @min(new_col, @as(i32, self.cols) - 1)));
-            },
-            .linefeed => {
-                self.cursor_row +|= 1;
-                if (self.cursor_row >= self.rows) {
-                    self.cursor_row = self.rows - 1;
-                    self.scrollScreenUp(1);
-                }
-            },
-            .carriage_return => {
-                self.cursor_col = 0;
-            },
-            .backspace => {
-                if (self.cursor_col > 0) self.cursor_col -= 1;
-            },
-            .erase_display => |mode| {
-                switch (mode) {
-                    0 => { // erase from cursor to end
-                        const start = @as(usize, self.cursor_row) * self.cols + self.cursor_col;
-                        @memset(self.screen[start..], vt_mod.Cell{});
-                    },
-                    1 => { // erase from start to cursor
-                        const end = @as(usize, self.cursor_row) * self.cols + self.cursor_col + 1;
-                        @memset(self.screen[0..@min(end, self.screen.len)], vt_mod.Cell{});
-                    },
-                    2 => { // erase all
-                        @memset(self.screen, vt_mod.Cell{});
-                    },
-                    else => {},
-                }
-            },
-            .erase_line => |mode| {
-                const row_start = @as(usize, self.cursor_row) * self.cols;
-                switch (mode) {
-                    0 => { // erase from cursor to end of line
-                        const start = row_start + self.cursor_col;
-                        const end = row_start + self.cols;
-                        if (start < self.screen.len) {
-                            @memset(self.screen[start..@min(end, self.screen.len)], vt_mod.Cell{});
-                        }
-                    },
-                    1 => { // erase from start of line to cursor
-                        const end = row_start + self.cursor_col + 1;
-                        @memset(self.screen[row_start..@min(end, self.screen.len)], vt_mod.Cell{});
-                    },
-                    2 => { // erase entire line
-                        const end = row_start + self.cols;
-                        @memset(self.screen[row_start..@min(end, self.screen.len)], vt_mod.Cell{});
-                    },
-                    else => {},
-                }
-            },
-            .scroll_up => |n| self.scrollScreenUp(n),
-            .scroll_down => |n| self.scrollScreenDown(n),
-            .insert_lines => |n| {
-                // Insert n blank lines at cursor row, pushing existing lines down
-                const count = @min(n, self.rows - self.cursor_row);
-                if (count == 0) return;
-                // Move lines down (backwards to avoid overlap)
-                var dst_row_i: isize = @as(isize, self.rows) - 1;
-                const count_i: isize = @intCast(count);
-                while (dst_row_i >= @as(isize, self.cursor_row) + count_i) : (dst_row_i -= 1) {
-                    const src_row: usize = @intCast(dst_row_i - count_i);
-                    const dst_row: usize = @intCast(dst_row_i);
-                    const src = src_row * self.cols;
-                    const dst = dst_row * self.cols;
-                    @memcpy(self.screen[dst..][0..self.cols], self.screen[src..][0..self.cols]);
-                }
-                // Clear inserted lines
-                const clear_start = @as(usize, self.cursor_row) * self.cols;
-                const clear_end = clear_start + @as(usize, count) * self.cols;
-                @memset(self.screen[clear_start..clear_end], vt_mod.Cell{});
-            },
-            .delete_lines => |n| {
-                // Delete n lines at cursor row, pulling lines up
-                const count = @min(n, self.rows - self.cursor_row);
-                if (count == 0) return;
-                const move_rows = self.rows - self.cursor_row - count;
-                if (move_rows > 0) {
-                    const src_start = @as(usize, self.cursor_row + count) * self.cols;
-                    const dst_start = @as(usize, self.cursor_row) * self.cols;
-                    const len = @as(usize, move_rows) * self.cols;
-                    std.mem.copyForwards(vt_mod.Cell, self.screen[dst_start..][0..len], self.screen[src_start..][0..len]);
-                }
-                // Clear vacated bottom lines
-                const clear_start = @as(usize, self.rows - count) * self.cols;
-                @memset(self.screen[clear_start..], vt_mod.Cell{});
-            },
-            .sgr => |params| {
-                if (params.reset) {
-                    self.pen_fg = .default;
-                    self.pen_bg = .default;
-                    self.pen_attr = .{};
-                }
-                if (params.fg) |fg| self.pen_fg = fg;
-                if (params.bg) |bg| self.pen_bg = bg;
-                if (params.attr) |attr| {
-                    // Merge attribute bits (SGR sets individual flags)
-                    if (attr.bold) self.pen_attr.bold = true;
-                    if (attr.dim) self.pen_attr.dim = true;
-                    if (attr.italic) self.pen_attr.italic = true;
-                    if (attr.underline) self.pen_attr.underline = true;
-                    if (attr.blink) self.pen_attr.blink = true;
-                    if (attr.inverse) self.pen_attr.inverse = true;
-                    if (attr.hidden) self.pen_attr.hidden = true;
-                    if (attr.strikethrough) self.pen_attr.strikethrough = true;
-                }
-            },
             .set_title => |t| {
                 const len: u8 = @intCast(@min(t.len, self.title.len));
                 @memcpy(self.title[0..len], t[0..len]);
                 self.title_len = len;
             },
-            .alt_screen => |enter| {
-                if (enter and !self.in_alt_screen) {
-                    // Enter alternate screen: save main buffer and cursor
-                    self.saved_cursor_row = self.cursor_row;
-                    self.saved_cursor_col = self.cursor_col;
-                    // Save main screen into alt_screen_buf
-                    if (self.alt_screen_buf == null) {
-                        self.alt_screen_buf = self.allocator.alloc(vt_mod.Cell, self.screen.len) catch null;
-                    }
-                    if (self.alt_screen_buf) |buf| {
-                        if (buf.len == self.screen.len) {
-                            @memcpy(buf, self.screen);
-                        }
-                    }
-                    // Clear screen for alt screen apps
-                    @memset(self.screen, vt_mod.Cell{});
-                    self.cursor_row = 0;
-                    self.cursor_col = 0;
-                    self.in_alt_screen = true;
-                } else if (!enter and self.in_alt_screen) {
-                    // Leave alternate screen: restore saved main buffer
-                    if (self.alt_screen_buf) |buf| {
-                        if (buf.len == self.screen.len) {
-                            @memcpy(self.screen, buf);
-                        }
-                    }
-                    self.cursor_row = self.saved_cursor_row;
-                    self.cursor_col = self.saved_cursor_col;
-                    self.in_alt_screen = false;
-                    // Reset pen
-                    self.pen_fg = .default;
-                    self.pen_bg = .default;
-                    self.pen_attr = .{};
+            else => {
+                if (self.grid.applyEvent(ev)) |cpr| {
+                    var cpr_buf: [32]u8 = undefined;
+                    const response = std.fmt.bufPrint(&cpr_buf, "\x1b[{d};{d}R", .{
+                        cpr.row, cpr.col,
+                    }) catch return;
+                    _ = self.pty.write(response) catch {};
                 }
             },
-            .cursor_position_report => {
-                // Respond with ESC[row;colR (1-based)
-                var cpr_buf: [32]u8 = undefined;
-                const cpr = std.fmt.bufPrint(&cpr_buf, "\x1b[{d};{d}R", .{
-                    self.cursor_row + 1,
-                    self.cursor_col + 1,
-                }) catch return;
-                _ = self.pty.write(cpr) catch {};
-            },
-            else => {}, // bell, tab, cursor_visible, scroll_region etc.
         }
-    }
-
-    fn scrollScreenUp(self: *PaneState, n: u16) void {
-        const rows_to_scroll = @min(n, self.rows);
-        const move_rows = self.rows - rows_to_scroll;
-        if (move_rows > 0) {
-            const src_start = @as(usize, rows_to_scroll) * self.cols;
-            const dst_start: usize = 0;
-            const len = @as(usize, move_rows) * self.cols;
-            std.mem.copyForwards(vt_mod.Cell, self.screen[dst_start .. dst_start + len], self.screen[src_start .. src_start + len]);
-        }
-        // Clear the vacated bottom rows
-        const clear_start = @as(usize, move_rows) * self.cols;
-        @memset(self.screen[clear_start..], vt_mod.Cell{});
-    }
-
-    fn scrollScreenDown(self: *PaneState, n: u16) void {
-        const rows_to_scroll = @min(n, self.rows);
-        const move_rows = self.rows - rows_to_scroll;
-        if (move_rows > 0) {
-            // Move rows downward — must copy backwards to avoid overlap.
-            // Use signed arithmetic to avoid unsigned underflow.
-            var dst_row_i: isize = @as(isize, self.rows) - 1;
-            const scroll_i: isize = @intCast(rows_to_scroll);
-            while (dst_row_i >= scroll_i) : (dst_row_i -= 1) {
-                const src_row: usize = @intCast(dst_row_i - scroll_i);
-                const dst_row: usize = @intCast(dst_row_i);
-                const src = src_row * self.cols;
-                const dst = dst_row * self.cols;
-                @memcpy(self.screen[dst .. dst + self.cols], self.screen[src .. src + self.cols]);
-            }
-        }
-        // Clear the vacated top rows
-        const clear_end = @as(usize, rows_to_scroll) * self.cols;
-        @memset(self.screen[0..clear_end], vt_mod.Cell{});
     }
 };
 
@@ -402,7 +183,7 @@ pub const Server = struct {
             const state = entry.value_ptr.*;
             state.pty.close();
             state.scrollback.deinit(self.allocator);
-            self.allocator.free(state.screen);
+            state.grid.deinit();
             self.allocator.destroy(state);
         }
         self.pane_states.deinit();
@@ -716,13 +497,13 @@ pub const Server = struct {
             },
             .scroll_half_page_up => {
                 if (self.pane_states.get(active_id)) |state| {
-                    state.scroll_offset +|= state.rows / 2;
+                    state.scroll_offset +|= state.grid.viewport_rows / 2;
                     self.compose();
                 }
             },
             .scroll_half_page_down => {
                 if (self.pane_states.get(active_id)) |state| {
-                    state.scroll_offset -|= state.rows / 2;
+                    state.scroll_offset -|= state.grid.viewport_rows / 2;
                     self.compose();
                 }
             },
@@ -747,14 +528,12 @@ pub const Server = struct {
         const inner = self.innerPaneSize();
         const pty = try pty_mod.Pty.spawn(shell_z, inner.cols, inner.rows);
 
-        const screen_len = @as(usize, inner.cols) * @as(usize, inner.rows);
-        const screen = try self.allocator.alloc(vt_mod.Cell, screen_len);
-        errdefer self.allocator.free(screen);
-        @memset(screen, vt_mod.Cell{});
-
         const sb_lines = self.config.scrollback_lines;
         const sb_bytes = self.config.scrollback_max_bytes;
         const sb = try scrollback_mod.Scrollback.init(self.allocator, sb_lines, sb_bytes);
+
+        var grid = try grid_mod.Grid.init(self.allocator, inner.cols, inner.rows);
+        errdefer grid.deinit();
 
         const state = try self.allocator.create(PaneState);
         errdefer self.allocator.destroy(state);
@@ -763,9 +542,7 @@ pub const Server = struct {
             .pty = pty,
             .vt_parser = vt_mod.Parser.init(),
             .scrollback = sb,
-            .screen = screen,
-            .cols = inner.cols,
-            .rows = inner.rows,
+            .grid = grid,
         };
 
         try self.pane_states.put(pane_id, state);
@@ -780,7 +557,7 @@ pub const Server = struct {
             _ = self.pane_states.remove(pane_id);
             state.pty.close();
             state.scrollback.deinit(self.allocator);
-            self.allocator.free(screen);
+            state.grid.deinit();
             self.allocator.destroy(state);
             return error.EpollCtlFailed;
         }
@@ -796,8 +573,7 @@ pub const Server = struct {
         _ = r;
         s.pty.close();
         s.scrollback.deinit(self.allocator);
-        if (s.alt_screen_buf) |buf| self.allocator.free(buf);
-        self.allocator.free(s.screen);
+        s.grid.deinit();
         self.allocator.destroy(s);
     }
 
@@ -913,48 +689,27 @@ pub const Server = struct {
         const regions = active_tab.pane_tree.calculateRegions(total_region) catch return;
         defer self.allocator.free(regions);
 
-        // Resize each pane's PTY and screen buffer to match its actual region
+        // Resize each pane's PTY and grid to match its actual region (with reflow)
         for (regions) |entry| {
             const pane_state = self.pane_states.get(entry.id) orelse continue;
             const rgn = entry.region;
             // Inner content area (minus border)
             const new_cols = if (rgn.cols > 2) rgn.cols - 2 else 1;
             const new_rows = if (rgn.rows > 2) rgn.rows - 2 else 1;
-            if (pane_state.cols != new_cols or pane_state.rows != new_rows) {
+            if (pane_state.grid.cols != new_cols or pane_state.grid.viewport_rows != new_rows) {
                 {
                     const log_fd = std.posix.open("/tmp/zlice-resize.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch null;
                     if (log_fd) |fd| {
                         defer std.posix.close(fd);
                         var dbuf: [128]u8 = undefined;
-                        const msg = std.fmt.bufPrint(&dbuf, "RESIZE pane {}: {}x{} -> {}x{}\n", .{ entry.id, pane_state.cols, pane_state.rows, new_cols, new_rows }) catch "";
+                        const msg = std.fmt.bufPrint(&dbuf, "RESIZE pane {}: {}x{} -> {}x{}\n", .{ entry.id, pane_state.grid.cols, pane_state.grid.viewport_rows, new_cols, new_rows }) catch "";
                         _ = std.posix.write(fd, msg) catch {};
                     }
                 }
                 // Resize PTY — kernel sends SIGWINCH to child
                 pane_state.pty.setSize(new_cols, new_rows) catch {};
-                // Reallocate screen buffer and copy existing content
-                const new_len = @as(usize, new_cols) * @as(usize, new_rows);
-                const new_screen = self.allocator.alloc(vt_mod.Cell, new_len) catch continue;
-                @memset(new_screen, vt_mod.Cell{});
-                // Copy rows that fit
-                const copy_rows = @min(pane_state.rows, new_rows);
-                const copy_cols = @min(pane_state.cols, new_cols);
-                var cr: u16 = 0;
-                while (cr < copy_rows) : (cr += 1) {
-                    const old_off = @as(usize, cr) * pane_state.cols;
-                    const new_off = @as(usize, cr) * new_cols;
-                    @memcpy(new_screen[new_off..][0..copy_cols], pane_state.screen[old_off..][0..copy_cols]);
-                }
-                if (pane_state.alt_screen_buf) |buf| {
-                    self.allocator.free(buf);
-                    pane_state.alt_screen_buf = null;
-                }
-                self.allocator.free(pane_state.screen);
-                pane_state.screen = new_screen;
-                pane_state.cols = new_cols;
-                pane_state.rows = new_rows;
-                pane_state.cursor_row = @min(pane_state.cursor_row, new_rows -| 1);
-                pane_state.cursor_col = @min(pane_state.cursor_col, new_cols -| 1);
+                // Resize grid with reflow
+                pane_state.grid.resize(new_cols, new_rows) catch {};
             }
         }
 
@@ -979,7 +734,7 @@ pub const Server = struct {
                 if (log_fd) |fd| {
                     defer std.posix.close(fd);
                     var dbuf: [256]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&dbuf, "region: row={} col={} rows={} cols={} | pane: cols={} rows={} | screen: {}x{}\n", .{ region.row, region.col, region.rows, region.cols, pane_state.cols, pane_state.rows, self.screen.cols, self.screen.rows }) catch "";
+                    const msg = std.fmt.bufPrint(&dbuf, "region: row={} col={} rows={} cols={} | pane: cols={} rows={} | screen: {}x{}\n", .{ region.row, region.col, region.rows, region.cols, pane_state.grid.cols, pane_state.grid.viewport_rows, self.screen.cols, self.screen.rows }) catch "";
                     _ = std.posix.write(fd, msg) catch {};
                 }
             }
@@ -993,21 +748,20 @@ pub const Server = struct {
             const inner_rows = if (region.rows > 2) region.rows - 2 else 0;
             const inner_cols = if (region.cols > 2) region.cols - 2 else 0;
 
-            // Copy rows from pane screen into compositor screen
+            // Copy rows from pane grid into compositor screen
             var r: u16 = 0;
             while (r < inner_rows) : (r += 1) {
-                if (r >= pane_state.rows) break;
+                if (r >= pane_state.grid.viewport_rows) break;
                 const screen_row = inner_row + r;
                 if (screen_row >= self.screen.rows) break;
 
                 var c: u16 = 0;
                 while (c < inner_cols) : (c += 1) {
-                    if (c >= pane_state.cols) break;
+                    if (c >= pane_state.grid.cols) break;
                     const screen_col = inner_col + c;
                     if (screen_col >= self.screen.cols) break;
 
-                    const pane_idx = @as(usize, r) * pane_state.cols + c;
-                    const vt_cell = pane_state.screen[pane_idx];
+                    const vt_cell = pane_state.grid.getCell(r, c);
 
                     const screen_cell = self.screen.cellAt(screen_row, screen_col);
                     screen_cell.* = render_mod.Cell{
@@ -1134,17 +888,9 @@ pub const Server = struct {
         var it = self.pane_states.iterator();
         while (it.next()) |entry| {
             const state = entry.value_ptr.*;
-            state.pty.setSize(inner.cols, inner.rows) catch {};
-            const new_len = @as(usize, inner.cols) * @as(usize, inner.rows);
-            if (state.cols != inner.cols or state.rows != inner.rows) {
-                const new_screen = self.allocator.alloc(vt_mod.Cell, new_len) catch continue;
-                self.allocator.free(state.screen);
-                state.screen = new_screen;
-                state.cols = inner.cols;
-                state.rows = inner.rows;
-                @memset(state.screen, vt_mod.Cell{});
-                state.cursor_row = 0;
-                state.cursor_col = 0;
+            if (state.grid.cols != inner.cols or state.grid.viewport_rows != inner.rows) {
+                state.pty.setSize(inner.cols, inner.rows) catch {};
+                state.grid.resize(inner.cols, inner.rows) catch {};
             }
         }
     }
@@ -1190,9 +936,9 @@ test "PaneState applyEvent print" {
 
     const cols: u16 = 10;
     const rows: u16 = 5;
-    const screen = try allocator.alloc(vt_mod.Cell, @as(usize, cols) * rows);
-    defer allocator.free(screen);
-    @memset(screen, vt_mod.Cell{});
+
+    var grid = try grid_mod.Grid.init(allocator, cols, rows);
+    defer grid.deinit();
 
     var sb = try scrollback_mod.Scrollback.init(allocator, 100, 4096);
     defer sb.deinit(allocator);
@@ -1202,16 +948,14 @@ test "PaneState applyEvent print" {
         .pty = undefined, // not used in this test
         .vt_parser = vt_mod.Parser.init(),
         .scrollback = sb,
-        .screen = screen,
-        .cols = cols,
-        .rows = rows,
+        .grid = grid,
     };
     // Detach scrollback ownership so deinit isn't called twice
     state.scrollback.count = 0;
 
     state.applyEvent(.{ .print = 'A' });
-    try std.testing.expectEqual(@as(u21, 'A'), state.screen[0].char);
-    try std.testing.expectEqual(@as(u16, 1), state.cursor_col);
+    try std.testing.expectEqual(@as(u21, 'A'), state.grid.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u16, 1), state.grid.cursor_col);
 }
 
 test "PaneState applyEvent cursor_pos" {
@@ -1219,9 +963,9 @@ test "PaneState applyEvent cursor_pos" {
 
     const cols: u16 = 80;
     const rows: u16 = 24;
-    const screen = try allocator.alloc(vt_mod.Cell, @as(usize, cols) * rows);
-    defer allocator.free(screen);
-    @memset(screen, vt_mod.Cell{});
+
+    var grid = try grid_mod.Grid.init(allocator, cols, rows);
+    defer grid.deinit();
 
     var sb = try scrollback_mod.Scrollback.init(allocator, 100, 4096);
     defer sb.deinit(allocator);
@@ -1231,17 +975,12 @@ test "PaneState applyEvent cursor_pos" {
         .pty = undefined,
         .vt_parser = vt_mod.Parser.init(),
         .scrollback = sb,
-        .screen = screen,
-        .cols = cols,
-        .rows = rows,
+        .grid = grid,
     };
 
     state.applyEvent(.{ .cursor_pos = .{ .row = 5, .col = 10 } });
-    try std.testing.expectEqual(@as(u16, 5), state.cursor_row);
-    try std.testing.expectEqual(@as(u16, 10), state.cursor_col);
-
-    // Free the scrollback that was moved into state
-    // (it will be freed by the defers above since `sb` still owns the memory)
+    try std.testing.expectEqual(@as(u16, 5), state.grid.cursor_row);
+    try std.testing.expectEqual(@as(u16, 10), state.grid.cursor_col);
 }
 
 test "PaneState applyEvent erase_display 2" {
@@ -1249,11 +988,14 @@ test "PaneState applyEvent erase_display 2" {
 
     const cols: u16 = 10;
     const rows: u16 = 5;
-    const screen = try allocator.alloc(vt_mod.Cell, @as(usize, cols) * rows);
-    defer allocator.free(screen);
+
+    var grid = try grid_mod.Grid.init(allocator, cols, rows);
+    defer grid.deinit();
 
     // Fill with non-blank cells
-    for (screen) |*c| c.* = vt_mod.Cell{ .char = 'X' };
+    for (grid.rows.items) |*r| {
+        for (r.cells) |*c| c.* = vt_mod.Cell{ .char = 'X' };
+    }
 
     var sb = try scrollback_mod.Scrollback.init(allocator, 100, 4096);
     defer sb.deinit(allocator);
@@ -1263,15 +1005,17 @@ test "PaneState applyEvent erase_display 2" {
         .pty = undefined,
         .vt_parser = vt_mod.Parser.init(),
         .scrollback = sb,
-        .screen = screen,
-        .cols = cols,
-        .rows = rows,
+        .grid = grid,
     };
 
     state.applyEvent(.{ .erase_display = 2 });
 
-    for (state.screen) |c| {
-        try std.testing.expectEqual(@as(u21, ' '), c.char);
+    var r: u16 = 0;
+    while (r < rows) : (r += 1) {
+        var c: u16 = 0;
+        while (c < cols) : (c += 1) {
+            try std.testing.expectEqual(@as(u21, ' '), state.grid.getCell(r, c).char);
+        }
     }
 }
 

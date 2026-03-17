@@ -7,6 +7,7 @@ pub const terminal = @import("terminal.zig");
 pub const pty = @import("pty.zig");
 pub const vt = @import("vt.zig");
 pub const scrollback = @import("scrollback.zig");
+pub const grid = @import("grid.zig");
 pub const mode = @import("mode.zig");
 pub const input = @import("input.zig");
 pub const config = @import("config.zig");
@@ -243,6 +244,7 @@ test {
     _ = pty;
     _ = vt;
     _ = scrollback;
+    _ = grid;
     _ = mode;
     _ = input;
     _ = config;
