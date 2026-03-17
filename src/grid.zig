@@ -179,6 +179,12 @@ pub const Grid = struct {
                 self.cursor_row = @intCast(@max(0, @min(new_row, @as(i32, self.viewport_rows) - 1)));
                 self.cursor_col = @intCast(@max(0, @min(new_col, @as(i32, self.cols) - 1)));
             },
+            .cursor_line_move => |delta| {
+                // CNL/CPL: move N lines + set col=0
+                const new_row: i32 = @as(i32, self.cursor_row) + delta;
+                self.cursor_row = @intCast(@max(0, @min(new_row, @as(i32, self.viewport_rows) - 1)));
+                self.cursor_col = 0;
+            },
             .linefeed => {
                 self.cursor_row +|= 1;
                 if (self.cursor_row >= self.viewport_rows) {

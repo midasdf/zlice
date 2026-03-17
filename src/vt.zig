@@ -38,6 +38,7 @@ pub const SgrParams = struct {
 pub const Event = union(enum) {
     print: u21,
     cursor_move: struct { row: i16, col: i16 },
+    cursor_line_move: i16, // CNL/CPL: move N lines + set col=0
     cursor_pos: struct { row: u16, col: u16 },
     erase_display: u8,
     erase_line: u8,
@@ -365,6 +366,10 @@ pub const Parser = struct {
                 .row = 0,
                 .col = -@as(i16, @intCast(self.getParam(0, 1))),
             }},
+            // Cursor Next Line (CNL) — move N lines down, col=0
+            'E' => return .{ .cursor_line_move = @as(i16, @intCast(self.getParam(0, 1))) },
+            // Cursor Previous Line (CPL) — move N lines up, col=0
+            'F' => return .{ .cursor_line_move = -@as(i16, @intCast(self.getParam(0, 1))) },
             // Cursor position (CUP) — 1-based → 0-based
             'H', 'f' => {
                 const row = self.getParam(0, 1);

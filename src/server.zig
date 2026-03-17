@@ -622,10 +622,15 @@ pub const Server = struct {
     fn handlePtyOutput(self: *Server, pane_id: pane_mod.PaneId) void {
         const state = self.pane_states.get(pane_id) orelse return;
         var buf: [4096]u8 = undefined;
+        // Temporary debug: dump PTY output
+        const dump_fd = std.posix.open("/tmp/zlice-pty-dump.bin", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch null;
+        defer if (dump_fd) |fd| std.posix.close(fd);
         const n = state.pty.read(&buf) catch {
             return; // Error reading — HUP handler will clean up
         };
         if (n == 0) return; // EOF — child process exited; EPOLLHUP handler will clean up
+
+        if (dump_fd) |fd| _ = std.posix.write(fd, buf[0..n]) catch {};
 
         // Feed bytes through VT parser and update pane screen buffer
         const was_in_alt = state.grid.in_alt_screen;
