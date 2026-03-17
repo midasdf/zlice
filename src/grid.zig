@@ -138,21 +138,57 @@ pub const Grid = struct {
         return self.viewport_rows;
     }
 
+    // ── Character width ───────────────────────────────────────────────────────
+
+    /// Returns the display width of a Unicode codepoint (1 or 2).
+    /// CJK characters, fullwidth forms, and some symbols are 2 cells wide.
+    fn charWidth(cp: u21) u16 {
+        // CJK Unified Ideographs
+        if (cp >= 0x4E00 and cp <= 0x9FFF) return 2;
+        // CJK Unified Ideographs Extension A
+        if (cp >= 0x3400 and cp <= 0x4DBF) return 2;
+        // CJK Compatibility Ideographs
+        if (cp >= 0xF900 and cp <= 0xFAFF) return 2;
+        // Hiragana
+        if (cp >= 0x3040 and cp <= 0x309F) return 2;
+        // Katakana
+        if (cp >= 0x30A0 and cp <= 0x30FF) return 2;
+        // Fullwidth Forms
+        if (cp >= 0xFF01 and cp <= 0xFF60) return 2;
+        if (cp >= 0xFFE0 and cp <= 0xFFE6) return 2;
+        // Halfwidth Katakana (1-wide)
+        if (cp >= 0xFF65 and cp <= 0xFF9F) return 1;
+        // CJK Symbols and Punctuation
+        if (cp >= 0x3000 and cp <= 0x303F) return 2;
+        // Hangul Syllables
+        if (cp >= 0xAC00 and cp <= 0xD7AF) return 2;
+        // Enclosed CJK Letters
+        if (cp >= 0x3200 and cp <= 0x32FF) return 2;
+        // CJK Compatibility
+        if (cp >= 0x3300 and cp <= 0x33FF) return 2;
+        // Bopomofo
+        if (cp >= 0x3100 and cp <= 0x312F) return 2;
+        // CJK Extension B+
+        if (cp >= 0x20000 and cp <= 0x2FA1F) return 2;
+        return 1;
+    }
+
     // ── Apply VT Event ───────────────────────────────────────────────────────
 
     /// Apply a VT event. Returns an optional CPR response to write to the PTY.
     pub fn applyEvent(self: *Grid, ev: vt.Event) ?CprResponse {
         switch (ev) {
             .print => |ch| {
-                // Auto-wrap: if cursor is at right margin, wrap to next line
-                if (self.cursor_col >= self.cols) {
+                const w = charWidth(ch);
+
+                // Auto-wrap: if cursor + char width exceeds right margin
+                if (self.cursor_col + w > self.cols) {
                     self.cursor_col = 0;
                     self.cursor_row +|= 1;
                     if (self.cursor_row >= self.viewport_rows) {
                         self.cursor_row = self.viewport_rows - 1;
                         self.scrollUp(1);
                     }
-                    // Mark this new row as wrapped (non-canonical)
                     if (self.getRow(self.cursor_row)) |rr| {
                         rr.is_canonical = false;
                     }
@@ -166,8 +202,17 @@ pub const Grid = struct {
                             .attr = self.pen_attr,
                         };
                     }
+                    // For wide chars, fill next cell with a spacer (null char)
+                    if (w == 2 and self.cursor_col + 1 < r.cells.len) {
+                        r.cells[self.cursor_col + 1] = .{
+                            .char = 0, // spacer for wide char
+                            .fg = self.pen_fg,
+                            .bg = self.pen_bg,
+                            .attr = self.pen_attr,
+                        };
+                    }
                 }
-                self.cursor_col += 1;
+                self.cursor_col += w;
             },
             .cursor_pos => |cp| {
                 self.cursor_row = @min(cp.row, self.viewport_rows -| 1);

@@ -255,6 +255,9 @@ pub const Screen = struct {
 
 /// Write a single Cell as terminal escape sequences (SGR + UTF-8 codepoint).
 pub fn serializeCell(cell: Cell, writer: anytype) !void {
+    // Skip spacer cells (second cell of wide characters)
+    if (cell.char == 0) return;
+
     // Build SGR: reset, then apply fg, bg, attr.
     try writer.writeAll("\x1b[0");
 
