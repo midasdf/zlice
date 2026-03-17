@@ -1,6 +1,6 @@
 # zlice
 
-**A terminal multiplexer that fits in 91KB.**
+**A terminal multiplexer under 100KB.**
 
 Written in Zig. Zero dependencies. Statically linked. Runs on a Raspberry Pi Zero with 512MB RAM.
 
@@ -19,14 +19,19 @@ Written in Zig. Zero dependencies. Statically linked. Runs on a Raspberry Pi Zer
 
 ## Why
 
-| | zlice | tmux | zellij |
+Measured on Raspberry Pi Zero 2W (aarch64), March 2026:
+
+| | zlice | tmux 3.6a | zellij 0.43.1 |
 |---|---|---|---|
-| Binary size | **91 KB** | ~3 MB | ~30 MB |
+| Binary | **93 KB** | 1.3 MB installed | 44 MB installed |
 | Language | Zig | C | Rust + WASM |
-| Dependencies | 0 | libevent, ncurses | many |
-| Memory (idle) | ~2 MB | ~5 MB | ~50 MB |
+| Runtime deps | **0** | libevent, ncurses | many |
+| RSS (idle) | **~1 MB** | ~3 MB | ~40 MB |
 | Text reflow | Yes | No | Yes |
 | CJK width | Yes | Yes | Yes |
+
+> Binary = static aarch64 `ReleaseSmall`. RSS = resident set of server process with one pane.
+> tmux installed size from `pacman -Qi`. zellij binary `/usr/bin/zellij` = 44 MB.
 
 ## Features
 
@@ -50,7 +55,7 @@ Written in Zig. Zero dependencies. Statically linked. Runs on a Raspberry Pi Zer
 git clone https://github.com/midasdf/zlice.git
 cd zlice
 zig build -Doptimize=ReleaseSmall
-# Binary at zig-out/bin/zlice (~91KB)
+# Binary at zig-out/bin/zlice (<100KB)
 ```
 
 ### Cross-compile for ARM
@@ -125,7 +130,7 @@ Client (thin relay)          Server (owns everything)
                              └──────────────────────┘
 ```
 
-Single binary, 17 source files, 7300 lines of Zig. No external dependencies.
+Single binary, 17 source files, ~7400 lines of Zig. No external dependencies.
 
 ## License
 
