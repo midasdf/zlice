@@ -5,6 +5,7 @@
 Written in Zig. Zero dependencies. Statically linked. Light enough to run where others won't.
 
 ![zplit screenshot](docs/screenshot.png)
+![zplit tab2](docs/screenshot-tab2.png)
 
 ## Why
 
