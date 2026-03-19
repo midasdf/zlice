@@ -645,6 +645,8 @@ pub const Grid = struct {
         const alloc = self.allocator;
 
         // Phase 1: Compute cursor's linear position
+        // cursor_row is viewport-relative; convert to absolute index
+        const cursor_abs = self.absRow(self.cursor_row);
         var cursor_linear: usize = 0;
         {
             var canonical_idx: usize = 0;
@@ -655,7 +657,7 @@ pub const Grid = struct {
                     canonical_idx += 1;
                     char_in_canonical = 0;
                 }
-                if (row_idx == self.cursor_row) {
+                if (row_idx == cursor_abs) {
                     cursor_linear = canonical_idx * 1_000_000 + char_in_canonical + self.cursor_col;
                     break;
                 }
@@ -746,37 +748,84 @@ pub const Grid = struct {
             current_canonical += 1;
         }
 
+
         // Phase 5: Adjust to viewport height
         while (self.rows.items.len < new_rows) {
             try self.rows.append(alloc, try Row.init(alloc, new_cols, true));
         }
 
-        if (self.rows.items.len > new_rows) {
-            // First, remove empty trailing rows
-            while (self.rows.items.len > new_rows) {
-                const last = &self.rows.items[self.rows.items.len - 1];
-                if (last.contentLen() == 0 and self.rows.items.len - 1 > new_cursor_row) {
-                    var removed = self.rows.pop().?;
-                    removed.deinit(alloc);
-                } else {
-                    break;
-                }
+        // Remove empty trailing rows (below cursor)
+        while (self.rows.items.len > new_rows) {
+            const last = &self.rows.items[self.rows.items.len - 1];
+            if (last.contentLen() == 0 and self.rows.items.len - 1 > new_cursor_row) {
+                var removed = self.rows.pop().?;
+                removed.deinit(alloc);
+            } else {
+                break;
             }
-            // If still too many rows, keep them but adjust viewport
-            // The viewport shows the last new_rows rows (where cursor is)
-            if (self.rows.items.len > new_rows) {
-                // Ensure cursor is within the visible viewport at the bottom
-                const total: u16 = @intCast(self.rows.items.len);
-                const viewport_start = total -| new_rows;
-                if (new_cursor_row < viewport_start) {
-                    new_cursor_row = viewport_start;
+        }
+
+        // Remove blank rows between scrollback content and new content.
+        // After 'clear' + reflow, blank rows from the old viewport appear
+        // in the visible area between old scrollback and new content.
+        // This runs in a loop because each removal shifts the viewport window,
+        // potentially exposing more blank rows from scrollback.
+        if (new_cursor_row > 0) {
+            var total_removed: usize = 0;
+            while (true) {
+                const vp_start: usize = if (self.rows.items.len > new_rows)
+                    self.rows.items.len - new_rows
+                else
+                    0;
+                // Scan forward from viewport start to find a blank-then-content pattern
+                var blank_start: ?usize = null;
+                var blank_end: usize = 0;
+                var found_gap = false;
+                var scan: usize = vp_start;
+                while (scan < new_cursor_row) : (scan += 1) {
+                    if (self.rows.items[scan].contentLen() == 0) {
+                        if (blank_start == null) blank_start = scan;
+                        blank_end = scan + 1;
+                    } else if (blank_start != null) {
+                        // Content row after blank region — this gap should be removed
+                        found_gap = true;
+                        break;
+                    }
                 }
+                if (!found_gap) break;
+                const bs = blank_start.?;
+                const count = blank_end - bs;
+                // Remove blank rows (reverse to preserve indices)
+                var ri: usize = count;
+                while (ri > 0) {
+                    ri -= 1;
+                    var r = self.rows.orderedRemove(bs + ri);
+                    r.deinit(alloc);
+                }
+                new_cursor_row -= @intCast(count);
+                total_removed += count;
+            }
+            // Backfill blank rows at the bottom to maintain viewport size
+            while (self.rows.items.len < new_rows) {
+                self.rows.append(alloc, Row.init(alloc, new_cols, true) catch break) catch break;
             }
         }
 
         self.cols = new_cols;
         self.viewport_rows = new_rows;
-        self.cursor_row = @min(new_cursor_row, @as(u16, @intCast(self.rows.items.len)) -| 1);
+
+        // Convert new_cursor_row (absolute) to viewport-relative
+        if (self.rows.items.len > new_rows) {
+            const viewport_start: u16 = @intCast(self.rows.items.len - new_rows);
+            if (new_cursor_row >= viewport_start) {
+                self.cursor_row = new_cursor_row - viewport_start;
+            } else {
+                // Cursor is in scrollback; clamp to top of viewport
+                self.cursor_row = 0;
+            }
+        } else {
+            self.cursor_row = @min(new_cursor_row, @as(u16, @intCast(self.rows.items.len)) -| 1);
+        }
         self.cursor_col = @min(new_cursor_col, new_cols -| 1);
     }
 
