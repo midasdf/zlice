@@ -293,14 +293,36 @@ pub const Grid = struct {
                                 @memset(r.cells, Cell{});
                             }
                         } else {
-                            // Main screen: append new blank rows to preserve scrollback
-                            var i: u16 = 0;
-                            while (i < self.viewport_rows) : (i += 1) {
-                                var new_row = Row.init(self.allocator, self.cols, true) catch break;
-                                self.rows.append(self.allocator, new_row) catch {
-                                    new_row.deinit(self.allocator);
-                                    break;
-                                };
+                            // Main screen: push only content rows to scrollback,
+                            // then clear the viewport in place.
+                            // This avoids blank scrollback rows that cause gaps after reflow.
+                            const total = self.rows.items.len;
+                            const vp_start = if (total > self.viewport_rows) total - self.viewport_rows else 0;
+                            // Find last content row in viewport
+                            var last_content: usize = total;
+                            while (last_content > vp_start) {
+                                if (self.rows.items[last_content - 1].contentLen() > 0) break;
+                                last_content -= 1;
+                            }
+                            if (last_content > vp_start) {
+                                // There are content rows in the viewport — push them to scrollback
+                                // by appending new blank rows (only as many as the content rows)
+                                const content_count = last_content - vp_start;
+                                var i: usize = 0;
+                                while (i < content_count) : (i += 1) {
+                                    var new_row = Row.init(self.allocator, self.cols, true) catch break;
+                                    self.rows.append(self.allocator, new_row) catch {
+                                        new_row.deinit(self.allocator);
+                                        break;
+                                    };
+                                }
+                            }
+                            // Clear all viewport rows
+                            const new_total = self.rows.items.len;
+                            const new_vp_start = if (new_total > self.viewport_rows) new_total - self.viewport_rows else 0;
+                            for (self.rows.items[new_vp_start..]) |*r| {
+                                @memset(r.cells, Cell{});
+                                r.is_canonical = true;
                             }
                             self.cursor_row = 0;
                         }
