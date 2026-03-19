@@ -4,16 +4,7 @@
 
 Written in Zig. Zero dependencies. Statically linked. Light enough to run where others won't.
 
-```
- Tab 1    Tab 2
-┌ fish ──────────────────────┐┌ vim ─────────────────────────┐
-│ $ zig build                ││  1│ const std = @import(..); │
-│ Build succeeded            ││  2│                          │
-│ $ _                        ││  3│ pub fn main() !void {    │
-│                            ││  ~                           │
-└────────────────────────────┘└─────────────────────────────┘
- NORMAL  Ctrl+p → Pane | Ctrl+t → Tab | Ctrl+s → Scroll
-```
+![zplit screenshot](docs/screenshot.png)
 
 ## Why
 
@@ -115,18 +106,17 @@ scroll_mode = "ctrl+s"
 
 ## Architecture
 
-```
-Client (thin relay)          Server (owns everything)
-┌──────────────┐             ┌──────────────────────┐
-│ Raw mode     │◄──socket──►│ PTY management       │
-│ Input parse  │             │ VT parser (custom)   │
-│ Mode state   │             │ Grid (reflow engine) │
-│              │             │ Screen compositor    │
-└──────────────┘             │ Tab/Pane tree        │
-                             └──────────────────────┘
-```
+Single binary acts as both client and server, connected via Unix domain socket.
 
-Single binary, 17 source files, ~7400 lines of Zig. No external dependencies.
+| Client (thin relay) | | Server (owns everything) |
+|---|---|---|
+| Terminal raw mode | Unix | PTY management |
+| Input parser (CSI) | domain | VT parser (custom) |
+| Mode state machine | socket | Grid + reflow engine |
+| | | Screen compositor |
+| | | Tab / Pane tree |
+
+17 source files, ~7400 lines of Zig. No external dependencies.
 
 ## License
 
