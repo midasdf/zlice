@@ -657,18 +657,8 @@ pub const Grid = struct {
         }
 
         if (self.cols != new_cols) {
-            // Trim scrollback before reflow — scrollback rows were invisible and
-            // can leak into the viewport after reflow if total shrinks below new_rows.
-            // This matches tmux behavior (scrollback is discarded on width change).
-            const scrollback_count = if (self.rows.items.len > self.viewport_rows)
-                self.rows.items.len - self.viewport_rows
-            else
-                0;
-            if (scrollback_count > 0) {
-                for (self.rows.items[0..scrollback_count]) |*r| r.deinit(self.allocator);
-                std.mem.copyForwards(Row, self.rows.items[0..], self.rows.items[scrollback_count..self.rows.items.len]);
-                self.rows.items.len -= scrollback_count;
-            }
+            // Preserve scrollback across width changes — reflow handles
+            // re-wrapping all rows (scrollback + viewport) correctly.
             try self.reflow(new_cols, new_rows);
         } else {
             try self.resizeHeight(new_rows);
