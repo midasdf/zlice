@@ -16,7 +16,7 @@ pub const Pty = struct {
     /// Spawn a new PTY with the given shell and terminal dimensions.
     pub fn spawn(shell: [:0]const u8, cols: u16, rows: u16) !Pty {
         // Open /dev/ptmx (PTY master multiplexer)
-        const master_fd = try posix.openZ("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true }, 0);
+        const master_fd = try posix.openZ("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true }, 0);
         errdefer posix.close(master_fd);
 
         // Unlock the PTY slave (TIOCSPTLCK = 0)

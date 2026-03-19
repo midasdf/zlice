@@ -36,6 +36,11 @@ pub const SgrParams = struct {
     bg: ?Color = null,
 };
 
+pub const TitleData = struct {
+    buf: [255]u8,
+    len: u8,
+};
+
 pub const Event = union(enum) {
     print: u21,
     cursor_move: struct { row: i16, col: i16 },
@@ -56,7 +61,7 @@ pub const Event = union(enum) {
     backspace,
     tab,
     bell,
-    set_title: []const u8,
+    set_title: TitleData,
     alt_screen: bool,
     cursor_visible: bool,
 };
@@ -85,7 +90,7 @@ pub const Parser = struct {
     // CSI parameter accumulator
     params: [MAX_PARAMS]u16 = [_]u16{0} ** MAX_PARAMS,
     param_idx: usize = 0,
-    has_param: bool = false, // at least one digit seen for current param
+    has_params: u16 = 0, // bitmask: bit N set if param N had at least one digit
     private: bool = false, // '?' or '>' prefix seen
 
     // OSC accumulator
@@ -104,14 +109,15 @@ pub const Parser = struct {
     fn resetCsi(self: *Parser) void {
         self.params = [_]u16{0} ** MAX_PARAMS;
         self.param_idx = 0;
-        self.has_param = false;
+        self.has_params = 0;
         self.private = false;
     }
 
     fn getParam(self: *const Parser, idx: usize, default: u16) u16 {
         if (idx > self.param_idx) return default;
         const v = self.params[idx];
-        return if (v == 0 and !self.has_param) default else v;
+        const has_digit = (self.has_params & (@as(u16, 1) << @intCast(idx))) != 0;
+        return if (v == 0 and !has_digit) default else v;
     }
 
     // Returns the actual stored param value (0 means not set / literal 0).
@@ -263,7 +269,7 @@ pub const Parser = struct {
                     '0'...'9' => {
                         self.state = .csi_param;
                         self.params[0] = byte - '0';
-                        self.has_param = true;
+                        self.has_params |= 1; // mark param 0
                         return null;
                     },
                     ';' => {
@@ -291,10 +297,10 @@ pub const Parser = struct {
             .csi_param => {
                 switch (byte) {
                     '0'...'9' => {
-                        const digit = byte - '0';
+                        const digit: u16 = byte - '0';
                         const cur = self.params[self.param_idx];
-                        self.params[self.param_idx] = cur *% 10 +% digit;
-                        self.has_param = true;
+                        self.params[self.param_idx] = cur *| 10 +| digit;
+                        self.has_params |= @as(u16, 1) << @intCast(self.param_idx);
                         return null;
                     },
                     ';' => {
@@ -459,12 +465,12 @@ pub const Parser = struct {
         const p = self.rawParam(0);
         switch (final) {
             'h' => switch (p) {
-                1049, 47 => return .{ .alt_screen = true },
+                1049, 1047, 47 => return .{ .alt_screen = true },
                 25 => return .{ .cursor_visible = true },
                 else => return null,
             },
             'l' => switch (p) {
-                1049, 47 => return .{ .alt_screen = false },
+                1049, 1047, 47 => return .{ .alt_screen = false },
                 25 => return .{ .cursor_visible = false },
                 else => return null,
             },
@@ -587,7 +593,11 @@ pub const Parser = struct {
         // Expect "0;" or "2;" prefix
         if (buf.len < 2) return null;
         if ((buf[0] == '0' or buf[0] == '2') and buf[1] == ';') {
-            return .{ .set_title = buf[2..] };
+            const title_src = buf[2..];
+            const len: u8 = @intCast(@min(title_src.len, 255));
+            var result = TitleData{ .buf = undefined, .len = len };
+            @memcpy(result.buf[0..len], title_src[0..len]);
+            return .{ .set_title = result };
         }
         return null;
     }
@@ -810,7 +820,7 @@ test "parse OSC set title" {
     const ev = p.feed(0x07);
     try std.testing.expect(ev != null);
     switch (ev.?) {
-        .set_title => |t| try std.testing.expectEqualStrings("Hello", t),
+        .set_title => |t| try std.testing.expectEqualStrings("Hello", t.buf[0..t.len]),
         else => return error.WrongEvent,
     }
 }

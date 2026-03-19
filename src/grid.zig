@@ -56,6 +56,10 @@ pub const Grid = struct {
     pen_bg: vt.Color = .default,
     pen_attr: vt.Attr = .{},
 
+    // Scroll region (DECSTBM) — 0-based, inclusive top/bottom
+    scroll_top: u16 = 0,
+    scroll_bottom: u16 = 0, // 0 means "viewport_rows - 1" (full screen)
+
     // Alternate screen support
     saved_main_rows: ?[]Row = null,
     saved_cursor_row: u16 = 0,
@@ -231,10 +235,16 @@ pub const Grid = struct {
                 self.cursor_col = 0;
             },
             .linefeed => {
-                self.cursor_row +|= 1;
-                if (self.cursor_row >= self.viewport_rows) {
-                    self.cursor_row = self.viewport_rows - 1;
-                    self.scrollUp(1);
+                const bottom = self.effectiveScrollBottom();
+                if (self.cursor_row == bottom) {
+                    // At the bottom of scroll region — scroll region up
+                    if (self.hasScrollRegion()) {
+                        self.scrollRegionUp(self.effectiveScrollTop(), bottom, 1);
+                    } else {
+                        self.scrollUp(1);
+                    }
+                } else if (self.cursor_row < self.viewport_rows - 1) {
+                    self.cursor_row += 1;
                 }
                 // The row we landed on after a linefeed is canonical
                 if (self.getRow(self.cursor_row)) |rr| {
@@ -316,67 +326,35 @@ pub const Grid = struct {
                     else => {},
                 }
             },
-            .scroll_up => |n| self.scrollUp(n),
-            .scroll_down => |n| self.scrollDown(n),
-            .insert_lines => |n| {
-                // insert_lines operates within the viewport only
-                const vp_rows = self.viewport_rows;
-                const count = @min(n, vp_rows - self.cursor_row);
-                if (count == 0) return null;
-                // Shift rows down within viewport: start from bottom of viewport
-                var dst_vp: isize = @as(isize, vp_rows) - 1;
-                const count_i: isize = @intCast(count);
-                while (dst_vp >= @as(isize, self.cursor_row) + count_i) : (dst_vp -= 1) {
-                    const src_vp: u16 = @intCast(dst_vp - count_i);
-                    const dst_vp_u: u16 = @intCast(dst_vp);
-                    const src_abs = self.absRow(src_vp);
-                    const dst_abs = self.absRow(dst_vp_u);
-                    if (src_abs < self.rows.items.len and dst_abs < self.rows.items.len) {
-                        const tmp = self.rows.items[dst_abs].cells;
-                        self.rows.items[dst_abs].cells = self.rows.items[src_abs].cells;
-                        self.rows.items[src_abs].cells = tmp;
-                        self.rows.items[dst_abs].is_canonical = self.rows.items[src_abs].is_canonical;
-                    }
-                }
-                // Clear the inserted rows
-                var i: u16 = 0;
-                while (i < count) : (i += 1) {
-                    const vp_idx: u16 = self.cursor_row + i;
-                    if (self.getRow(vp_idx)) |r| {
-                        @memset(r.cells, Cell{});
-                        r.is_canonical = true;
-                    }
+            .scroll_up => |n| {
+                if (self.hasScrollRegion()) {
+                    self.scrollRegionUp(self.effectiveScrollTop(), self.effectiveScrollBottom(), n);
+                } else {
+                    self.scrollUp(n);
                 }
             },
-            .delete_lines => |n| {
-                // delete_lines operates within the viewport only
-                const vp_rows = self.viewport_rows;
-                const count = @min(n, vp_rows - self.cursor_row);
+            .scroll_down => |n| {
+                if (self.hasScrollRegion()) {
+                    self.scrollRegionDown(self.effectiveScrollTop(), self.effectiveScrollBottom(), n);
+                } else {
+                    self.scrollDown(n);
+                }
+            },
+            .insert_lines => |n| {
+                // insert_lines operates within the scroll region (or viewport)
+                const bottom = self.effectiveScrollBottom();
+                if (self.cursor_row > bottom) return null;
+                const count = @min(n, bottom - self.cursor_row + 1);
                 if (count == 0) return null;
-                const move_rows = vp_rows - self.cursor_row - count;
-                if (move_rows > 0) {
-                    var i: u16 = 0;
-                    while (i < move_rows) : (i += 1) {
-                        const src_vp: u16 = self.cursor_row + count + i;
-                        const dst_vp: u16 = self.cursor_row + i;
-                        const src_abs = self.absRow(src_vp);
-                        const dst_abs = self.absRow(dst_vp);
-                        if (src_abs < self.rows.items.len and dst_abs < self.rows.items.len) {
-                            const tmp = self.rows.items[dst_abs].cells;
-                            self.rows.items[dst_abs].cells = self.rows.items[src_abs].cells;
-                            self.rows.items[src_abs].cells = tmp;
-                            self.rows.items[dst_abs].is_canonical = self.rows.items[src_abs].is_canonical;
-                        }
-                    }
-                }
-                // Clear rows at the bottom of the viewport
-                var i: u16 = vp_rows - count;
-                while (i < vp_rows) : (i += 1) {
-                    if (self.getRow(i)) |r| {
-                        @memset(r.cells, Cell{});
-                        r.is_canonical = true;
-                    }
-                }
+                self.scrollRegionDown(self.cursor_row, bottom, count);
+            },
+            .delete_lines => |n| {
+                // delete_lines operates within the scroll region (or viewport)
+                const bottom = self.effectiveScrollBottom();
+                if (self.cursor_row > bottom) return null;
+                const count = @min(n, bottom - self.cursor_row + 1);
+                if (count == 0) return null;
+                self.scrollRegionUp(self.cursor_row, bottom, count);
             },
             .sgr => |params| {
                 if (params.reset) {
@@ -482,10 +460,89 @@ pub const Grid = struct {
                     .col = self.cursor_col + 1,
                 };
             },
+            .scroll_region => |sr| {
+                self.scroll_top = sr.top;
+                self.scroll_bottom = sr.bottom;
+                // DECSTBM resets cursor to home position
+                self.cursor_row = 0;
+                self.cursor_col = 0;
+            },
             .set_title => return null, // handled externally
             else => {},
         }
         return null;
+    }
+
+    // ── Scroll region helpers ────────────────────────────────────────────────
+
+    fn effectiveScrollTop(self: *const Grid) u16 {
+        return self.scroll_top;
+    }
+
+    fn effectiveScrollBottom(self: *const Grid) u16 {
+        return if (self.scroll_bottom == 0) self.viewport_rows -| 1 else self.scroll_bottom;
+    }
+
+    fn hasScrollRegion(self: *const Grid) bool {
+        return self.scroll_top != 0 or (self.scroll_bottom != 0 and self.scroll_bottom != self.viewport_rows -| 1);
+    }
+
+    /// Scroll a region of the viewport up by n lines (content moves up, blank at bottom).
+    fn scrollRegionUp(self: *Grid, top: u16, bottom: u16, n: u16) void {
+        const region_height = bottom - top + 1;
+        const count = @min(n, region_height);
+        if (count == 0) return;
+
+        // Shift rows up within the region
+        var r: u16 = top;
+        while (r + count <= bottom) : (r += 1) {
+            const src_abs = self.absRow(r + count);
+            const dst_abs = self.absRow(r);
+            if (src_abs < self.rows.items.len and dst_abs < self.rows.items.len) {
+                const tmp = self.rows.items[dst_abs].cells;
+                self.rows.items[dst_abs].cells = self.rows.items[src_abs].cells;
+                self.rows.items[src_abs].cells = tmp;
+                self.rows.items[dst_abs].is_canonical = self.rows.items[src_abs].is_canonical;
+            }
+        }
+        // Blank the bottom rows of the region
+        var i: u16 = 0;
+        while (i < count) : (i += 1) {
+            const vp_idx = bottom - count + 1 + i;
+            if (self.getRow(vp_idx)) |row| {
+                @memset(row.cells, Cell{});
+                row.is_canonical = true;
+            }
+        }
+    }
+
+    /// Scroll a region of the viewport down by n lines (content moves down, blank at top).
+    fn scrollRegionDown(self: *Grid, top: u16, bottom: u16, n: u16) void {
+        const region_height = bottom - top + 1;
+        const count = @min(n, region_height);
+        if (count == 0) return;
+
+        // Shift rows down within the region
+        var r: u16 = bottom;
+        while (r >= top + count) : (r -= 1) {
+            const src_abs = self.absRow(r - count);
+            const dst_abs = self.absRow(r);
+            if (src_abs < self.rows.items.len and dst_abs < self.rows.items.len) {
+                const tmp = self.rows.items[dst_abs].cells;
+                self.rows.items[dst_abs].cells = self.rows.items[src_abs].cells;
+                self.rows.items[src_abs].cells = tmp;
+                self.rows.items[dst_abs].is_canonical = self.rows.items[src_abs].is_canonical;
+            }
+            if (r == top + count) break; // prevent underflow
+        }
+        // Blank the top rows of the region
+        var i: u16 = 0;
+        while (i < count) : (i += 1) {
+            if (self.getRow(top + i)) |row| {
+                @memset(row.cells, Cell{});
+                row.is_canonical = true;
+            }
+        }
     }
 
     // ── Scroll helpers ───────────────────────────────────────────────────────
@@ -556,9 +613,9 @@ pub const Grid = struct {
         // Blank the top viewport rows
         i = 0;
         while (i < count) : (i += 1) {
-            self.rows.items[vp_start + i] = Row.init(self.allocator, self.cols, true) catch Row{
-                .cells = &.{},
-                .is_canonical = true,
+            self.rows.items[vp_start + i] = Row.init(self.allocator, self.cols, true) catch {
+                // OOM: leave remaining rows with swapped (non-empty) content
+                return;
             };
         }
     }
@@ -567,6 +624,10 @@ pub const Grid = struct {
 
     pub fn resize(self: *Grid, new_cols: u16, new_rows: u16) !void {
         if (self.cols == new_cols and self.viewport_rows == new_rows and self.rows.items.len == new_rows) return;
+
+        // Reset scroll region on resize (standard terminal behavior)
+        self.scroll_top = 0;
+        self.scroll_bottom = 0;
 
         if (self.in_alt_screen) {
             try self.resizeSimple(new_cols, new_rows);

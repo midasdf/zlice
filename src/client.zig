@@ -275,14 +275,11 @@ fn handleStdinBytes(
                 },
                 .switch_mode => {
                     // Flush any pending forward bytes before mode switch
-                    if (i + 1 > forward_start) {
-                        // Don't include the mode-switch byte itself
-                        // Find start of this key's sequence
-                        const seq = input_parser.lastSequence();
-                        const fwd_end = if (i + 1 >= seq.len) i + 1 - seq.len else i;
-                        if (fwd_end > forward_start) {
-                            try sendFrame(sock_fd, .input, bytes[forward_start..fwd_end]);
-                        }
+                    // Don't include the mode-switch key's sequence
+                    const seq = input_parser.lastSequence();
+                    const fwd_end = if (i + 1 >= seq.len) i + 1 - seq.len else forward_start;
+                    if (fwd_end > forward_start) {
+                        try sendFrame(sock_fd, .input, bytes[forward_start..fwd_end]);
                     }
                     try dispatchAction(action, input_parser.lastSequence(), sock_fd);
                     forward_start = i + 1;

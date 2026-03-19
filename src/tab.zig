@@ -17,7 +17,22 @@ pub const Tab = struct {
     }
 
     pub fn setName(self: *Tab, new_name: []const u8) void {
-        const len = @min(new_name.len, self.name.len);
+        // Truncate at a valid UTF-8 boundary
+        var len = @min(new_name.len, self.name.len);
+        // Walk backwards to find a valid UTF-8 boundary
+        while (len > 0 and (new_name[len - 1] & 0xC0) == 0x80) {
+            // This is a continuation byte; check if the lead byte is included
+            var start = len - 1;
+            while (start > 0 and (new_name[start] & 0xC0) == 0x80) {
+                start -= 1;
+            }
+            // Determine expected sequence length from lead byte
+            const lead = new_name[start];
+            const expected: usize = if (lead >= 0xF0) 4 else if (lead >= 0xE0) 3 else if (lead >= 0xC0) 2 else 1;
+            if (start + expected <= len) break; // sequence is complete
+            len = start; // truncate incomplete sequence
+            break;
+        }
         @memcpy(self.name[0..len], new_name[0..len]);
         self.name_len = @intCast(len);
     }

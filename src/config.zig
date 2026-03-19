@@ -46,12 +46,8 @@ fn dupeAndTrack(cfg: *Config, allocator: std.mem.Allocator, str_val: []const u8)
 /// All heap-allocated string fields are owned by the Config's internal arena.
 /// Call cfg.deinit() to free all allocated memory at once.
 pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
-    var allocs = std.ArrayListUnmanaged([]const u8){};
-    errdefer {
-        for (allocs.items) |s| allocator.free(s);
-        allocs.deinit(allocator);
-    }
-    var cfg = Config{ ._allocator = allocator, ._allocs = allocs };
+    var cfg = Config{ ._allocator = allocator, ._allocs = .{} };
+    errdefer cfg.deinit();
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |raw_line| {

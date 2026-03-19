@@ -62,7 +62,7 @@ pub const PaneState = struct {
         switch (ev) {
             .set_title => |t| {
                 const len: u8 = @intCast(@min(t.len, self.title.len));
-                @memcpy(self.title[0..len], t[0..len]);
+                @memcpy(self.title[0..len], t.buf[0..len]);
                 self.title_len = len;
             },
             .device_attributes_request => {
@@ -100,6 +100,20 @@ pub const Server = struct {
     socket_path: []const u8, // owned, for cleanup
     session_name: []const u8, // owned, for session save
     next_pane_id: pane_mod.PaneId, // global pane ID counter (pane 0 is reserved for first tab)
+
+    /// Allocate a fresh pane ID, skipping any that are still in use.
+    fn allocPaneId(self: *Server) ?pane_mod.PaneId {
+        // Try up to 65536 candidates to find an unused ID
+        var attempts: u32 = 0;
+        while (attempts < std.math.maxInt(u16)) : (attempts += 1) {
+            const candidate = self.next_pane_id;
+            self.next_pane_id +%= 1; // wrapping increment
+            if (!self.pane_states.contains(candidate)) {
+                return candidate;
+            }
+        }
+        return null; // all 65536 IDs exhausted (practically impossible)
+    }
 
     // ── init ──────────────────────────────────────────────────────────────────
 
@@ -360,7 +374,12 @@ pub const Server = struct {
                 const hp = protocol.decodeHello(payload) catch return;
                 self.client_cols = hp.cols;
                 self.client_rows = hp.rows;
-                self.screen.resize(hp.cols, hp.rows) catch {};
+                self.screen.resize(hp.cols, hp.rows) catch {
+                    // OOM: keep old screen dimensions
+                    self.client_cols = self.screen.cols;
+                    self.client_rows = self.screen.rows;
+                    return;
+                };
                 self.screen.invalidate();
                 self.compose();
             },
@@ -382,7 +401,12 @@ pub const Server = struct {
                 const rp = protocol.decodeResize(payload) catch return;
                 self.client_cols = rp.cols;
                 self.client_rows = rp.rows;
-                self.screen.resize(rp.cols, rp.rows) catch {};
+                self.screen.resize(rp.cols, rp.rows) catch {
+                    // OOM: keep old screen dimensions
+                    self.client_cols = self.screen.cols;
+                    self.client_rows = self.screen.rows;
+                    return;
+                };
                 // Invalidate front buffer so full screen is redrawn
                 self.screen.invalidate();
                 // compose() handles per-pane PTY resize dynamically
@@ -415,17 +439,15 @@ pub const Server = struct {
 
         switch (cmd_id) {
             .split_horizontal => {
-                const new_id = self.next_pane_id;
+                const new_id = self.allocPaneId() orelse return;
                 _ = active_tab.pane_tree.splitPane(active_id, .horizontal, new_id) catch return;
-                self.next_pane_id += 1;
                 self.spawnPaneState(new_id) catch return;
                 active_tab.pane_tree.active_pane = new_id;
                 self.compose();
             },
             .split_vertical => {
-                const new_id = self.next_pane_id;
+                const new_id = self.allocPaneId() orelse return;
                 _ = active_tab.pane_tree.splitPane(active_id, .vertical, new_id) catch return;
-                self.next_pane_id += 1;
                 self.spawnPaneState(new_id) catch return;
                 active_tab.pane_tree.active_pane = new_id;
                 self.compose();
@@ -474,9 +496,8 @@ pub const Server = struct {
                 self.compose();
             },
             .new_tab => {
-                const new_pane_id = self.next_pane_id;
+                const new_pane_id = self.allocPaneId() orelse return;
                 _ = self.tab_manager.createTab(new_pane_id) catch return;
-                self.next_pane_id += 1;
                 self.spawnPaneState(new_pane_id) catch return;
                 self.compose();
             },
