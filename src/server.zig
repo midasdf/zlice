@@ -18,12 +18,12 @@ const session_mod = @import("session.zig");
 
 /// epoll data tag for the listen socket
 const TAG_LISTEN: u64 = 0xFFFF_FFFF_FFFF_0000;
-/// epoll data tag for the connected client socket
-const TAG_CLIENT: u64 = 0xFFFF_FFFF_FFFF_0001;
 /// epoll data tag for the signal fd
 const TAG_SIGNAL: u64 = 0xFFFF_FFFF_FFFF_0002;
 /// epoll data tags for PTY fds are encoded as: TAG_PTY_BASE | pane_id
 const TAG_PTY_BASE: u64 = 0x0001_0000_0000_0000;
+/// epoll data tags for client fds are encoded as: TAG_CLIENT_BASE | client_id
+const TAG_CLIENT_BASE: u64 = 0x0002_0000_0000_0000;
 
 fn ptyTag(pane_id: pane_mod.PaneId) u64 {
     return TAG_PTY_BASE | @as(u64, pane_id);
@@ -32,7 +32,6 @@ fn ptyTag(pane_id: pane_mod.PaneId) u64 {
 fn isPtyTag(tag: u64) bool {
     return (tag & TAG_PTY_BASE) != 0 and
         tag != TAG_LISTEN and
-        tag != TAG_CLIENT and
         tag != TAG_SIGNAL;
 }
 
@@ -40,8 +39,24 @@ fn paneIdFromTag(tag: u64) pane_mod.PaneId {
     return @intCast(tag & 0xFFFF);
 }
 
+fn clientTag(id: u16) u64 {
+    return TAG_CLIENT_BASE | @as(u64, id);
+}
+
+fn isClientTag(tag: u64) bool {
+    return (tag & TAG_CLIENT_BASE) != 0 and
+        tag != TAG_LISTEN and
+        tag != TAG_SIGNAL;
+}
+
+fn clientIdFromTag(tag: u64) u16 {
+    return @intCast(tag & 0xFFFF);
+}
+
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
+const MAX_CLIENTS: u8 = 8;
+const RECV_BUF_SIZE: usize = protocol.HEADER_SIZE + protocol.MAX_PAYLOAD_LEN;
 
 // ─── PaneState ────────────────────────────────────────────────────────────────
 
@@ -52,7 +67,6 @@ pub const PaneState = struct {
     vt_parser: vt_mod.Parser,
     scrollback: scrollback_mod.Scrollback,
     grid: grid_mod.Grid,
-    scroll_offset: u16 = 0, // lines scrolled back from live view
     /// Pane title (set by OSC set_title VT sequence or defaulted to "Pane N").
     title: [64]u8 = [_]u8{0} ** 64,
     title_len: u8 = 0,
@@ -82,6 +96,50 @@ pub const PaneState = struct {
     }
 };
 
+// ─── ClientState ──────────────────────────────────────────────────────────
+
+pub const ClientState = struct {
+    id: u16,
+    fd: posix.fd_t,
+    cols: u16 = 0,
+    rows: u16 = 0,
+    screen: render_mod.Screen,
+    active_tab: u8 = 0,
+    active_panes: [tab_mod.MAX_TABS]pane_mod.PaneId =
+        [_]pane_mod.PaneId{0} ** tab_mod.MAX_TABS,
+    scroll_offsets: std.AutoHashMap(pane_mod.PaneId, u16),
+    mode: mode_mod.Mode = .normal,
+    recv_buf: [RECV_BUF_SIZE]u8 = undefined,
+    recv_len: usize = 0,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, id: u16, fd: posix.fd_t) !*ClientState {
+        const cs = try allocator.create(ClientState);
+        cs.* = .{
+            .id = id,
+            .fd = fd,
+            .screen = try render_mod.Screen.init(allocator, 80, 24),
+            .scroll_offsets = std.AutoHashMap(pane_mod.PaneId, u16).init(allocator),
+            .allocator = allocator,
+        };
+        return cs;
+    }
+
+    pub fn deinit(self: *ClientState) void {
+        self.screen.deinit();
+        self.scroll_offsets.deinit();
+        self.allocator.destroy(self);
+    }
+
+    pub fn getScrollOffset(self: *const ClientState, pane_id: pane_mod.PaneId) u16 {
+        return self.scroll_offsets.get(pane_id) orelse 0;
+    }
+
+    pub fn setScrollOffset(self: *ClientState, pane_id: pane_mod.PaneId, offset: u16) void {
+        self.scroll_offsets.put(pane_id, offset) catch {};
+    }
+};
+
 // ─── Server struct ────────────────────────────────────────────────────────────
 
 pub const Server = struct {
@@ -90,13 +148,11 @@ pub const Server = struct {
     tab_manager: tab_mod.TabManager,
     pane_states: std.AutoHashMap(pane_mod.PaneId, *PaneState),
     listen_fd: posix.fd_t,
-    client_fd: ?posix.fd_t,
     epoll_fd: posix.fd_t,
-    screen: render_mod.Screen,
-    client_cols: u16,
-    client_rows: u16,
+    clients: std.AutoHashMap(u16, *ClientState),
+    next_client_id: u16 = 0,
+    active_client: ?u16 = null,
     running: bool,
-    current_mode: mode_mod.Mode,
     socket_path: []const u8, // owned, for cleanup
     session_name: []const u8, // owned, for session save
     next_pane_id: pane_mod.PaneId, // global pane ID counter (pane 0 is reserved for first tab)
@@ -167,10 +223,6 @@ pub const Server = struct {
         var tab_manager = try tab_mod.TabManager.init(allocator);
         errdefer tab_manager.deinit();
 
-        // Create screen with default size
-        var screen = try render_mod.Screen.init(allocator, DEFAULT_COLS, DEFAULT_ROWS);
-        errdefer screen.deinit();
-
         const path_copy = try allocator.dupe(u8, socket_path);
         errdefer allocator.free(path_copy);
 
@@ -183,13 +235,9 @@ pub const Server = struct {
             .tab_manager = tab_manager,
             .pane_states = std.AutoHashMap(pane_mod.PaneId, *PaneState).init(allocator),
             .listen_fd = listen_fd,
-            .client_fd = null,
             .epoll_fd = epoll_fd,
-            .screen = screen,
-            .client_cols = DEFAULT_COLS,
-            .client_rows = DEFAULT_ROWS,
+            .clients = std.AutoHashMap(u16, *ClientState).init(allocator),
             .running = true,
-            .current_mode = .normal,
             .socket_path = path_copy,
             .session_name = name_copy,
             .next_pane_id = 1, // pane 0 is the initial pane of the first tab
@@ -205,8 +253,8 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         // Close all PTYs and free pane states
-        var it = self.pane_states.iterator();
-        while (it.next()) |entry| {
+        var ps_it = self.pane_states.iterator();
+        while (ps_it.next()) |entry| {
             const state = entry.value_ptr.*;
             state.pty.close();
             state.scrollback.deinit(self.allocator);
@@ -215,7 +263,15 @@ pub const Server = struct {
         }
         self.pane_states.deinit();
 
-        if (self.client_fd) |fd| posix.close(fd);
+        // Close and free all clients
+        var cl_it = self.clients.valueIterator();
+        while (cl_it.next()) |cs_ptr| {
+            const cs = cs_ptr.*;
+            posix.close(cs.fd);
+            cs.deinit();
+        }
+        self.clients.deinit();
+
         posix.close(self.listen_fd);
         posix.close(self.epoll_fd);
 
@@ -229,7 +285,6 @@ pub const Server = struct {
         self.allocator.free(self.session_name);
 
         self.tab_manager.deinit();
-        self.screen.deinit();
     }
 
     // ── run ───────────────────────────────────────────────────────────────────
@@ -255,10 +310,6 @@ pub const Server = struct {
             if (linux.E.init(r) != .SUCCESS) return error.EpollCtlFailed;
         }
 
-        // Receive buffer for client frames
-        var recv_buf: [protocol.HEADER_SIZE + protocol.MAX_PAYLOAD_LEN]u8 = undefined;
-        var recv_len: usize = 0;
-
         while (self.running) {
             var events: [32]linux.epoll_event = undefined;
             const n_rc = linux.epoll_wait(self.epoll_fd, &events, events.len, -1);
@@ -272,77 +323,74 @@ pub const Server = struct {
                 const tag = ev.data.u64;
 
                 if (tag == TAG_LISTEN) {
-                    // Accept a new client (single-client: close previous if any)
-                    const new_client = posix.accept(self.listen_fd, null, null, posix.SOCK.CLOEXEC) catch continue;
-                    if (self.client_fd) |old| {
-                        const r2 = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, old, null);
-                        _ = r2;
-                        posix.close(old);
-                    }
-                    self.client_fd = new_client;
-                    {
-                        var client_ev = linux.epoll_event{
-                            .events = linux.EPOLL.IN | linux.EPOLL.ERR | linux.EPOLL.HUP,
-                            .data = .{ .u64 = TAG_CLIENT },
-                        };
-                        const r2 = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, new_client, &client_ev);
-                        if (linux.E.init(r2) != .SUCCESS) {
-                            posix.close(new_client);
-                            self.client_fd = null;
-                            continue;
-                        }
-                    }
-                    recv_len = 0;
-                    // Send hello_ack with empty payload
-                    self.sendFrame(.hello_ack, &.{}) catch {};
-                    // Hide cursor and force full redraw
-                    self.sendFrame(.render, "\x1b[?25l") catch {};
-
-                } else if (tag == TAG_CLIENT) {
-                    // Read from client
-                    const cfd = self.client_fd orelse continue;
-                    const space = recv_buf.len - recv_len;
-                    if (space == 0) {
-                        // Buffer full with no complete frame — protocol error, disconnect
-                        self.disconnectClient();
-                        recv_len = 0;
+                    // Accept a new client connection
+                    const new_fd = posix.accept(self.listen_fd, null, null, posix.SOCK.CLOEXEC) catch continue;
+                    if (self.clients.count() >= MAX_CLIENTS) {
+                        posix.close(new_fd);
                         continue;
                     }
-                    const n_read = posix.read(cfd, recv_buf[recv_len..]) catch {
-                        self.disconnectClient();
-                        recv_len = 0;
+                    // Assign ID (skip if in use)
+                    var id = self.next_client_id;
+                    while (self.clients.contains(id)) : (id +%= 1) {}
+                    self.next_client_id = id +% 1;
+
+                    const cs = ClientState.init(self.allocator, id, new_fd) catch {
+                        posix.close(new_fd);
+                        continue;
+                    };
+                    self.clients.put(id, cs) catch {
+                        cs.deinit();
+                        posix.close(new_fd);
+                        continue;
+                    };
+                    var client_ev = linux.epoll_event{
+                        .events = linux.EPOLL.IN | linux.EPOLL.ERR | linux.EPOLL.HUP,
+                        .data = .{ .u64 = clientTag(id) },
+                    };
+                    const r2 = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, new_fd, &client_ev);
+                    if (linux.E.init(r2) != .SUCCESS) {
+                        _ = self.clients.remove(id);
+                        cs.deinit();
+                        continue;
+                    }
+                    self.sendFrameTo(cs, .hello_ack, &.{}) catch {};
+                    // Hide cursor and force full redraw
+                    self.sendFrameTo(cs, .render, "\x1b[?25l") catch {};
+
+                } else if (isClientTag(tag)) {
+                    const client_id = clientIdFromTag(tag);
+                    const cs = self.clients.get(client_id) orelse continue;
+                    // Read into per-client recv_buf
+                    const space = cs.recv_buf.len - cs.recv_len;
+                    if (space == 0) {
+                        self.disconnectClient(client_id);
+                        continue;
+                    }
+                    const n_read = posix.read(cs.fd, cs.recv_buf[cs.recv_len..]) catch {
+                        self.disconnectClient(client_id);
                         continue;
                     };
                     if (n_read == 0) {
-                        self.disconnectClient();
-                        recv_len = 0;
+                        self.disconnectClient(client_id);
                         continue;
                     }
-                    recv_len += n_read;
-
-                    // Drain complete frames
+                    cs.recv_len += n_read;
+                    // Drain frames
                     var consumed: usize = 0;
-                    while (recv_len - consumed >= protocol.HEADER_SIZE) {
+                    while (cs.recv_len - consumed >= protocol.HEADER_SIZE) {
                         const hdr_slice: *const [protocol.HEADER_SIZE]u8 =
-                            recv_buf[consumed..][0..protocol.HEADER_SIZE];
-                        const hdr = protocol.decodeHeader(hdr_slice) catch {
-                            consumed += 1;
-                            continue;
-                        };
+                            cs.recv_buf[consumed..][0..protocol.HEADER_SIZE];
+                        const hdr = protocol.decodeHeader(hdr_slice) catch { consumed += 1; continue; };
                         const frame_end = consumed + protocol.HEADER_SIZE + hdr.payload_len;
-                        if (recv_len < frame_end) break;
-                        const payload = recv_buf[consumed + protocol.HEADER_SIZE .. frame_end];
-                        self.handleClientFrame(hdr.msg_type, payload);
+                        if (cs.recv_len < frame_end) break;
+                        const payload = cs.recv_buf[consumed + protocol.HEADER_SIZE .. frame_end];
+                        self.handleClientFrame(client_id, hdr.msg_type, payload);
                         consumed = frame_end;
                     }
-                    if (consumed > 0 and consumed < recv_len) {
-                        std.mem.copyForwards(u8, recv_buf[0..], recv_buf[consumed..recv_len]);
+                    if (consumed > 0 and consumed < cs.recv_len) {
+                        std.mem.copyForwards(u8, cs.recv_buf[0..], cs.recv_buf[consumed..cs.recv_len]);
                     }
-                    if (consumed > recv_len) {
-                        recv_len = 0;
-                    } else {
-                        recv_len -= consumed;
-                    }
+                    cs.recv_len = if (consumed > cs.recv_len) 0 else cs.recv_len - consumed;
 
                 } else if (tag == TAG_SIGNAL) {
                     // SIGTERM or SIGINT — save layout before exit
@@ -368,63 +416,48 @@ pub const Server = struct {
 
     // ── handleClientFrame ─────────────────────────────────────────────────────
 
-    fn handleClientFrame(self: *Server, msg_type: protocol.MessageType, payload: []const u8) void {
+    fn handleClientFrame(self: *Server, client_id: u16, msg_type: protocol.MessageType, payload: []const u8) void {
+        const cs = self.clients.get(client_id) orelse return;
         switch (msg_type) {
             .hello => {
                 const hp = protocol.decodeHello(payload) catch return;
-                self.client_cols = hp.cols;
-                self.client_rows = hp.rows;
-                self.screen.resize(hp.cols, hp.rows) catch {
-                    // OOM: keep old screen dimensions
-                    self.client_cols = self.screen.cols;
-                    self.client_rows = self.screen.rows;
-                    return;
-                };
-                self.screen.invalidate();
-                self.compose();
+                cs.cols = hp.cols;
+                cs.rows = hp.rows;
+                cs.screen.resize(hp.cols, hp.rows) catch {};
+                cs.screen.invalidate();
+                self.composeForClient(cs);
             },
             .input => {
-                // Write to active pane's PTY
-                const active_tab = self.tab_manager.activeTab();
-                const active_id = active_tab.pane_tree.active_pane;
-                if (self.pane_states.get(active_id)) |state| {
+                self.active_client = client_id;
+                const active_pane = cs.active_panes[cs.active_tab];
+                if (self.pane_states.get(active_pane)) |state| {
                     _ = state.pty.write(payload) catch {};
                 }
             },
             .command => {
                 if (payload.len < 1) return;
-                const cmd_raw = payload[0];
-                const cmd = std.meta.intToEnum(protocol.CommandId, cmd_raw) catch return;
-                self.handleCommand(cmd, payload[1..]);
+                self.active_client = client_id;
+                const cmd = std.meta.intToEnum(protocol.CommandId, payload[0]) catch return;
+                self.handleCommand(client_id, cmd, payload[1..]);
             },
             .resize => {
                 const rp = protocol.decodeResize(payload) catch return;
-                self.client_cols = rp.cols;
-                self.client_rows = rp.rows;
-                self.screen.resize(rp.cols, rp.rows) catch {
-                    // OOM: keep old screen dimensions
-                    self.client_cols = self.screen.cols;
-                    self.client_rows = self.screen.rows;
-                    return;
-                };
-                // Invalidate front buffer so full screen is redrawn
-                self.screen.invalidate();
-                // compose() handles per-pane PTY resize dynamically
-                self.compose();
+                cs.cols = rp.cols;
+                cs.rows = rp.rows;
+                cs.screen.resize(rp.cols, rp.rows) catch {};
+                cs.screen.invalidate();
+                self.composeAll();
             },
             .state => {
-                // Client mode changed — update server-side mode for status bar
                 if (payload.len >= 1) {
                     const new_mode = std.meta.intToEnum(mode_mod.Mode, payload[0]) catch .normal;
-                    // Reset scroll offset when leaving scroll mode
-                    if (self.current_mode == .scroll and new_mode != .scroll) {
-                        const at = self.tab_manager.activeTab();
-                        if (self.pane_states.get(at.pane_tree.active_pane)) |state| {
-                            state.scroll_offset = 0;
-                        }
+                    if (cs.mode == .scroll and new_mode != .scroll) {
+                        // Reset scroll offset on leaving scroll mode
+                        const active_pane = cs.active_panes[cs.active_tab];
+                        cs.scroll_offsets.put(active_pane, 0) catch {};
                     }
-                    self.current_mode = new_mode;
-                    self.compose();
+                    cs.mode = new_mode;
+                    self.composeAll();
                 }
             },
             else => {},
@@ -433,132 +466,136 @@ pub const Server = struct {
 
     // ── handleCommand ─────────────────────────────────────────────────────────
 
-    pub fn handleCommand(self: *Server, cmd_id: protocol.CommandId, payload: []const u8) void {
-        const active_tab = self.tab_manager.activeTab();
-        const active_id = active_tab.pane_tree.active_pane;
+    pub fn handleCommand(self: *Server, client_id: u16, cmd_id: protocol.CommandId, payload: []const u8) void {
+        const cs = self.clients.get(client_id) orelse return;
+        const active_tab = self.tab_manager.activeTab(cs.active_tab);
+        const active_pane_id = cs.active_panes[cs.active_tab];
 
         switch (cmd_id) {
             .split_horizontal => {
                 const new_id = self.allocPaneId() orelse return;
-                _ = active_tab.pane_tree.splitPane(active_id, .horizontal, new_id) catch return;
+                _ = active_tab.pane_tree.splitPane(active_pane_id, .horizontal, new_id) catch return;
                 self.spawnPaneState(new_id) catch return;
-                active_tab.pane_tree.active_pane = new_id;
-                self.compose();
+                cs.active_panes[cs.active_tab] = new_id;
+                self.composeAll();
             },
             .split_vertical => {
                 const new_id = self.allocPaneId() orelse return;
-                _ = active_tab.pane_tree.splitPane(active_id, .vertical, new_id) catch return;
+                _ = active_tab.pane_tree.splitPane(active_pane_id, .vertical, new_id) catch return;
                 self.spawnPaneState(new_id) catch return;
-                active_tab.pane_tree.active_pane = new_id;
-                self.compose();
+                cs.active_panes[cs.active_tab] = new_id;
+                self.composeAll();
             },
             .close_pane => {
-                const sibling = active_tab.pane_tree.closePane(active_id) orelse return;
-                self.destroyPaneState(active_id);
-                active_tab.pane_tree.active_pane = sibling;
-                self.compose();
+                const sibling = active_tab.pane_tree.closePane(active_pane_id) orelse return;
+                self.destroyPaneState(active_pane_id);
+                // Update ALL clients that had this pane focused
+                var it = self.clients.valueIterator();
+                while (it.next()) |other_cs| {
+                    if (other_cs.*.active_panes[cs.active_tab] == active_pane_id) {
+                        other_cs.*.active_panes[cs.active_tab] = sibling;
+                    }
+                    _ = other_cs.*.scroll_offsets.remove(active_pane_id);
+                }
+                self.composeAll();
             },
             .focus_pane => {
                 if (payload.len < 1) return;
-                const dir_raw = payload[0];
-                const dir = std.meta.intToEnum(protocol.Direction, dir_raw) catch return;
-                // Content area: row 1 (tab bar) to client_rows-2 (status bar)
-                const status_bar_rows: u16 = if (self.config.status_bar and self.client_rows > 0) 1 else 0;
-                const tab_bar_rows: u16 = if (self.client_rows > 0) 1 else 0;
+                const dir = std.meta.intToEnum(protocol.Direction, payload[0]) catch return;
+                const status_bar_rows: u16 = if (self.config.status_bar and cs.rows > 0) 1 else 0;
+                const tab_bar_rows: u16 = if (cs.rows > 0) 1 else 0;
                 const reserved = tab_bar_rows + status_bar_rows;
-                const content_rows = if (self.client_rows > reserved) self.client_rows - reserved else self.client_rows;
-                const total_region = pane_mod.Region{
-                    .row = tab_bar_rows,
-                    .col = 0,
-                    .rows = content_rows,
-                    .cols = self.client_cols,
-                };
+                const content_rows = if (cs.rows > reserved) cs.rows - reserved else cs.rows;
+                const total_region = pane_mod.Region{ .row = tab_bar_rows, .col = 0, .rows = content_rows, .cols = cs.cols };
                 const regions = active_tab.pane_tree.calculateRegions(total_region) catch return;
                 defer self.allocator.free(regions);
-                if (active_tab.pane_tree.focusDirection(active_id, dir, regions)) |new_id| {
-                    active_tab.pane_tree.active_pane = new_id;
-                    self.compose();
+                if (active_tab.pane_tree.focusDirection(active_pane_id, dir, regions)) |new_id| {
+                    cs.active_panes[cs.active_tab] = new_id;
+                    self.composeAll();
                 }
             },
             .resize_pane => {
                 if (payload.len < 3) return;
-                const dir_raw = payload[0];
-                const dir = std.meta.intToEnum(protocol.Direction, dir_raw) catch return;
-                const delta_hi = payload[1];
-                const delta_lo = payload[2];
-                const delta_u: u16 = (@as(u16, delta_hi) << 8) | delta_lo;
-                const delta: i16 = @bitCast(delta_u);
-                active_tab.pane_tree.resizePane(active_id, dir, delta);
-                self.compose();
+                const dir = std.meta.intToEnum(protocol.Direction, payload[0]) catch return;
+                const delta: i16 = @bitCast((@as(u16, payload[1]) << 8) | payload[2]);
+                active_tab.pane_tree.resizePane(active_pane_id, dir, delta);
+                self.composeAll();
             },
-            .toggle_fullscreen => {
-                // Stub: no-op for now
-                self.compose();
-            },
+            .toggle_fullscreen => self.composeAll(),
             .new_tab => {
                 const new_pane_id = self.allocPaneId() orelse return;
-                _ = self.tab_manager.createTab(new_pane_id) catch return;
+                const new_tab_idx = self.tab_manager.createTab(new_pane_id) catch return;
                 self.spawnPaneState(new_pane_id) catch return;
-                self.compose();
+                cs.active_tab = new_tab_idx;
+                cs.active_panes[new_tab_idx] = new_pane_id;
+                self.composeAll();
             },
             .close_tab => {
-                // Destroy all pane states for this tab before closing
-                self.destroyAllPanesInCurrentTab();
-                _ = self.tab_manager.closeTab(self.tab_manager.active);
-                self.compose();
+                self.destroyAllPanesInTab(cs.active_tab);
+                const nearest = self.tab_manager.closeTab(cs.active_tab) orelse return;
+                // Update ALL clients viewing the closed tab
+                const closed_tab = cs.active_tab;
+                var it = self.clients.valueIterator();
+                while (it.next()) |other_cs| {
+                    if (other_cs.*.active_tab == closed_tab) {
+                        other_cs.*.active_tab = nearest;
+                    }
+                }
+                self.composeAll();
             },
             .next_tab => {
-                self.tab_manager.nextTab();
-                self.compose();
+                cs.active_tab = self.tab_manager.nextTab(cs.active_tab);
+                self.composeForClient(cs);
             },
             .prev_tab => {
-                self.tab_manager.prevTab();
-                self.compose();
+                cs.active_tab = self.tab_manager.prevTab(cs.active_tab);
+                self.composeForClient(cs);
             },
             .switch_tab => {
                 if (payload.len < 1) return;
                 const target = payload[0];
                 if (target < tab_mod.MAX_TABS and self.tab_manager.tabs[target] != null) {
-                    self.tab_manager.active = target;
-                    self.compose();
+                    cs.active_tab = target;
+                    self.composeForClient(cs);
                 }
             },
             .rename_tab => {
                 if (payload.len > 0) {
-                    self.tab_manager.activeTab().setName(payload);
-                    self.compose();
+                    self.tab_manager.activeTab(cs.active_tab).setName(payload);
+                    self.composeAll();
                 }
             },
             .scroll_up_lines => {
-                if (self.pane_states.get(active_id)) |state| {
+                if (self.pane_states.get(active_pane_id)) |state| {
                     const max: u16 = @intCast(@min(state.grid.scrollbackLen(), std.math.maxInt(u16)));
-                    state.scroll_offset = @min(state.scroll_offset +| 1, max);
-                    self.compose();
+                    const cur = cs.getScrollOffset(active_pane_id);
+                    cs.setScrollOffset(active_pane_id, @min(cur +| 1, max));
+                    self.composeForClient(cs);
                 }
             },
             .scroll_down_lines => {
-                if (self.pane_states.get(active_id)) |state| {
-                    state.scroll_offset -|= 1;
-                    self.compose();
-                }
+                const cur = cs.getScrollOffset(active_pane_id);
+                cs.setScrollOffset(active_pane_id, cur -| 1);
+                self.composeForClient(cs);
             },
             .scroll_half_page_up => {
-                if (self.pane_states.get(active_id)) |state| {
+                if (self.pane_states.get(active_pane_id)) |state| {
                     const max: u16 = @intCast(@min(state.grid.scrollbackLen(), std.math.maxInt(u16)));
-                    state.scroll_offset = @min(state.scroll_offset +| (state.grid.viewport_rows / 2), max);
-                    self.compose();
+                    const cur = cs.getScrollOffset(active_pane_id);
+                    cs.setScrollOffset(active_pane_id, @min(cur +| (state.grid.viewport_rows / 2), max));
+                    self.composeForClient(cs);
                 }
             },
             .scroll_half_page_down => {
-                if (self.pane_states.get(active_id)) |state| {
-                    state.scroll_offset -|= state.grid.viewport_rows / 2;
-                    self.compose();
+                if (self.pane_states.get(active_pane_id)) |state| {
+                    const cur = cs.getScrollOffset(active_pane_id);
+                    cs.setScrollOffset(active_pane_id, cur -| (state.grid.viewport_rows / 2));
+                    self.composeForClient(cs);
                 }
             },
             .detach => {
-                // Save layout before disconnect
                 session_mod.saveSession(self.allocator, self.session_name, &self.tab_manager) catch {};
-                self.disconnectClient();
+                self.disconnectClient(client_id);
             },
             .quit => {
                 session_mod.saveSession(self.allocator, self.session_name, &self.tab_manager) catch {};
@@ -575,12 +612,20 @@ pub const Server = struct {
         const shell_z = try self.allocator.dupeZ(u8, shell);
         defer self.allocator.free(shell_z);
 
-        // Initial size: use client dimensions minus reserved UI rows/cols.
+        // Initial size: use active client dimensions minus reserved UI rows/cols.
         // The grid will be properly resized to the actual pane region on the first compose().
         const reserved_rows: u16 = 2 + 2; // tab bar + status bar + border top/bottom
         const reserved_cols: u16 = 2; // border left/right
-        const init_cols: u16 = if (self.client_cols > reserved_cols) self.client_cols - reserved_cols else 1;
-        const init_rows: u16 = if (self.client_rows > reserved_rows) self.client_rows - reserved_rows else 1;
+        var c_cols: u16 = DEFAULT_COLS;
+        var c_rows: u16 = DEFAULT_ROWS;
+        if (self.active_client) |ac_id| {
+            if (self.clients.get(ac_id)) |ac| {
+                if (ac.cols > 0) c_cols = ac.cols;
+                if (ac.rows > 0) c_rows = ac.rows;
+            }
+        }
+        const init_cols: u16 = if (c_cols > reserved_cols) c_cols - reserved_cols else 1;
+        const init_rows: u16 = if (c_rows > reserved_rows) c_rows - reserved_rows else 1;
         const pty = try pty_mod.Pty.spawn(shell_z, init_cols, init_rows);
 
         const sb_lines = self.config.scrollback_lines;
@@ -647,21 +692,32 @@ pub const Server = struct {
         }
         const tab_idx = found_tab_idx orelse return;
         const tab = &(self.tab_manager.tabs[tab_idx].?);
-        const was_active = (tab.pane_tree.active_pane == pane_id);
 
         // Try to close in the pane tree — returns sibling or null if last pane
         if (tab.pane_tree.closePane(pane_id)) |sibling| {
             self.destroyPaneState(pane_id);
-            if (was_active) {
-                tab.pane_tree.active_pane = sibling;
+            // Update ALL clients that had this pane focused
+            var it = self.clients.valueIterator();
+            while (it.next()) |cs_ptr| {
+                if (cs_ptr.*.active_panes[tab_idx] == pane_id) {
+                    cs_ptr.*.active_panes[tab_idx] = sibling;
+                }
+                _ = cs_ptr.*.scroll_offsets.remove(pane_id);
             }
-            self.compose();
+            self.composeAll();
         } else {
             // Last pane in tab — close the tab or keep it empty
             self.destroyPaneState(pane_id);
             if (self.tab_manager.tabCount() > 1) {
-                _ = self.tab_manager.closeTab(tab_idx);
-                self.compose();
+                const nearest = self.tab_manager.closeTab(tab_idx) orelse return;
+                // Update ALL clients viewing the closed tab
+                var it = self.clients.valueIterator();
+                while (it.next()) |cs_ptr| {
+                    if (cs_ptr.*.active_tab == tab_idx) {
+                        cs_ptr.*.active_tab = nearest;
+                    }
+                }
+                self.composeAll();
             } else {
                 // Last tab, last pane — quit
                 self.running = false;
@@ -688,38 +744,85 @@ pub const Server = struct {
         }
         const left_alt = was_in_alt and !state.grid.in_alt_screen;
 
-        // Only re-render if this pane is in the active tab
-        const active_tab = self.tab_manager.activeTab();
-        if (self.isPaneInTree(active_tab.pane_tree.root, pane_id)) {
-            // Force full redraw when leaving alt screen (restored content differs from compositor)
-            if (left_alt) self.screen.invalidate();
-            self.compose();
+        // Check if this pane is visible for any client, and invalidate screens if leaving alt screen
+        var any_visible = false;
+        var cl_it = self.clients.valueIterator();
+        while (cl_it.next()) |cs_ptr| {
+            const c = cs_ptr.*;
+            const tab = self.tab_manager.activeTab(c.active_tab);
+            if (self.isPaneInTree(tab.pane_tree.root, pane_id)) {
+                any_visible = true;
+                if (left_alt) c.screen.invalidate();
+            }
+        }
+        if (any_visible) {
+            self.composeAll();
         }
     }
 
-    // ── compose ───────────────────────────────────────────────────────────────
+    // ── composeAll ─────────────────────────────────────────────────────────
 
-    /// Composite all pane screen buffers onto the Screen, draw borders,
+    /// Resize PTYs based on active client's dimensions, then render for all clients.
+    fn composeAll(self: *Server) void {
+        // Pre-pass: resize PTYs based on active client's dimensions
+        if (self.active_client) |ac_id| {
+            if (self.clients.get(ac_id)) |ac| {
+                self.resizePtysForClient(ac);
+            }
+        }
+        // Render for each connected client
+        var it = self.clients.valueIterator();
+        while (it.next()) |cs| {
+            self.composeForClient(cs.*);
+        }
+    }
+
+    // ── resizePtysForClient ──────────────────────────────────────────────
+
+    fn resizePtysForClient(self: *Server, cs: *ClientState) void {
+        const status_bar_rows: u16 = if (self.config.status_bar and cs.rows > 0) 1 else 0;
+        const tab_bar_rows: u16 = if (cs.rows > 0) 1 else 0;
+        const reserved = tab_bar_rows + status_bar_rows;
+        const content_rows = cs.rows -| reserved;
+        const total_region = pane_mod.Region{ .row = tab_bar_rows, .col = 0, .rows = content_rows, .cols = cs.cols };
+        const active_tab = self.tab_manager.activeTab(cs.active_tab);
+        const regions = active_tab.pane_tree.calculateRegions(total_region) catch return;
+        defer self.allocator.free(regions);
+        for (regions) |entry| {
+            const pane_state = self.pane_states.get(entry.id) orelse continue;
+            const new_cols = if (entry.region.cols > 2) entry.region.cols - 2 else 1;
+            const new_rows = if (entry.region.rows > 2) entry.region.rows - 2 else 1;
+            if (pane_state.grid.cols != new_cols or pane_state.grid.viewport_rows != new_rows) {
+                pane_state.pty.setSize(new_cols, new_rows) catch {};
+                pane_state.grid.resize(new_cols, new_rows) catch {};
+            }
+        }
+    }
+
+    // ── composeForClient ─────────────────────────────────────────────────
+
+    /// Composite all pane screen buffers onto a client's Screen, draw borders,
     /// render the tab bar and status bar, send dirty regions to the client.
-    pub fn compose(self: *Server) void {
-        // Clear back buffer
-        self.screen.clear();
+    fn composeForClient(self: *Server, cs: *ClientState) void {
+        if (cs.cols == 0 or cs.rows == 0) return;
 
-        const status_bar_rows: u16 = if (self.config.status_bar and self.client_rows > 0) 1 else 0;
-        // Row 0 is reserved for the tab bar; last row for the status bar.
-        const tab_bar_rows: u16 = if (self.client_rows > 0) 1 else 0;
+        // Clear back buffer
+        cs.screen.clear();
+
+        const status_bar_rows: u16 = if (self.config.status_bar and cs.rows > 0) 1 else 0;
+        const tab_bar_rows: u16 = if (cs.rows > 0) 1 else 0;
         const reserved_rows = tab_bar_rows + status_bar_rows;
-        const content_rows = self.client_rows -| reserved_rows;
+        const content_rows = cs.rows -| reserved_rows;
         const content_start_row = tab_bar_rows;
 
         const total_region = pane_mod.Region{
             .row = content_start_row,
             .col = 0,
             .rows = content_rows,
-            .cols = self.client_cols,
+            .cols = cs.cols,
         };
 
-        // Collect tab names (used by both tab bar and status bar)
+        // Collect tab names
         var tab_names_buf: [tab_mod.MAX_TABS][]const u8 = undefined;
         var tab_names_len: usize = 0;
         for (&self.tab_manager.tabs) |*slot| {
@@ -731,47 +834,31 @@ pub const Server = struct {
         const tab_names = tab_names_buf[0..tab_names_len];
 
         // Render tab bar in row 0
-        if (tab_bar_rows > 0 and self.screen.rows > 0) {
+        if (tab_bar_rows > 0 and cs.screen.rows > 0) {
             const tab_bar_start: usize = 0;
-            const tab_bar_end = @as(usize, self.screen.cols);
-            if (tab_bar_end <= self.screen.back.len) {
-                const tab_bar_cells = self.screen.back[tab_bar_start..tab_bar_end];
+            const tab_bar_end = @as(usize, cs.screen.cols);
+            if (tab_bar_end <= cs.screen.back.len) {
+                const tab_bar_cells = cs.screen.back[tab_bar_start..tab_bar_end];
                 status_bar_mod.renderTabBar(
                     tab_bar_cells,
-                    self.screen.cols,
+                    cs.screen.cols,
                     tab_names,
-                    self.tab_manager.active,
+                    cs.active_tab,
                 );
             }
         }
 
-        // Calculate pane regions for the active tab
-        const active_tab = self.tab_manager.activeTab();
+        // Calculate pane regions for this client's active tab
+        const active_tab = self.tab_manager.activeTab(cs.active_tab);
         const regions = active_tab.pane_tree.calculateRegions(total_region) catch return;
         defer self.allocator.free(regions);
 
-        // Resize each pane's PTY and grid to match its actual region (with reflow)
-        for (regions) |entry| {
-            const pane_state = self.pane_states.get(entry.id) orelse continue;
-            const rgn = entry.region;
-            // Inner content area (minus border)
-            const new_cols = if (rgn.cols > 2) rgn.cols - 2 else 1;
-            const new_rows = if (rgn.rows > 2) rgn.rows - 2 else 1;
-            if (pane_state.grid.cols != new_cols or pane_state.grid.viewport_rows != new_rows) {
-                // Resize PTY — kernel sends SIGWINCH to child
-                pane_state.pty.setSize(new_cols, new_rows) catch {};
-                // Resize grid with reflow
-                pane_state.grid.resize(new_cols, new_rows) catch {};
-            }
-        }
-
-        // For each pane region, draw border with title and copy pane content inset by 1
+        // For each pane region, draw border with title and copy pane content
         for (regions) |entry| {
             const pane_state = self.pane_states.get(entry.id) orelse continue;
             const region = entry.region;
-            const is_active = (entry.id == active_tab.pane_tree.active_pane);
+            const is_active = (entry.id == cs.active_panes[cs.active_tab]);
 
-            // Use pane title if set, otherwise generate a default "Pane N" label.
             var default_title_buf: [16]u8 = undefined;
             const title: []const u8 = if (pane_state.title_len > 0)
                 pane_state.title[0..pane_state.title_len]
@@ -780,34 +867,31 @@ pub const Server = struct {
                 break :blk s;
             };
 
-            // Draw zellij-style border with title in top frame line
-            self.screen.drawBorderWithTitle(region, title, is_active);
+            cs.screen.drawBorderWithTitle(region, title, is_active);
 
-            // Content area is inset by 1 on each side for the border
             const inner_row = region.row + 1;
             const inner_col = region.col + 1;
             const inner_rows = if (region.rows > 2) region.rows - 2 else 0;
             const inner_cols = if (region.cols > 2) region.cols - 2 else 0;
 
-            // Copy rows from pane grid into compositor screen
             var r: u16 = 0;
             while (r < inner_rows) : (r += 1) {
                 if (r >= pane_state.grid.viewport_rows) break;
                 const screen_row = inner_row + r;
-                if (screen_row >= self.screen.rows) break;
+                if (screen_row >= cs.screen.rows) break;
 
                 var c: u16 = 0;
                 while (c < inner_cols) : (c += 1) {
                     if (c >= pane_state.grid.cols) break;
                     const screen_col = inner_col + c;
-                    if (screen_col >= self.screen.cols) break;
+                    if (screen_col >= cs.screen.cols) break;
 
-                    // Apply scroll offset: clamp to available scrollback
+                    // Apply scroll offset from per-client state
                     const max_scroll: u16 = @intCast(@min(pane_state.grid.scrollbackLen(), std.math.maxInt(u16)));
-                    const eff_scroll = @min(pane_state.scroll_offset, max_scroll);
+                    const eff_scroll = @min(cs.getScrollOffset(entry.id), max_scroll);
                     const vt_cell = pane_state.grid.getCellScrolled(r, c, eff_scroll);
 
-                    const screen_cell = self.screen.cellAt(screen_row, screen_col);
+                    const screen_cell = cs.screen.cellAt(screen_row, screen_col);
                     screen_cell.* = render_mod.Cell{
                         .char = vt_cell.char,
                         .fg = vt_cell.fg,
@@ -818,62 +902,57 @@ pub const Server = struct {
             }
         }
 
-        // Render status bar in the bottom row if enabled
-        if (status_bar_rows > 0 and self.client_rows > 0) {
-            const bar_row = self.client_rows - 1;
-            if (bar_row < self.screen.rows) {
-                const bar_start = @as(usize, bar_row) * self.screen.cols;
-                const bar_end = bar_start + self.screen.cols;
-                if (bar_end <= self.screen.back.len) {
-                    const bar_cells = self.screen.back[bar_start..bar_end];
+        // Render status bar
+        if (status_bar_rows > 0 and cs.rows > 0) {
+            const bar_row = cs.rows - 1;
+            if (bar_row < cs.screen.rows) {
+                const bar_start = @as(usize, bar_row) * cs.screen.cols;
+                const bar_end = bar_start + cs.screen.cols;
+                if (bar_end <= cs.screen.back.len) {
+                    const bar_cells = cs.screen.back[bar_start..bar_end];
                     status_bar_mod.renderStatusBar(
                         bar_cells,
-                        self.screen.cols,
-                        self.current_mode,
+                        cs.screen.cols,
+                        cs.mode,
                     );
                 }
             }
         }
 
-        // Send dirty regions to client
-        self.sendDirtyRegions();
+        // Send dirty regions to this client
+        self.sendDirtyRegionsTo(cs);
 
         // Position cursor in active pane and show it
-        const active_pane_id = active_tab.pane_tree.active_pane;
+        const active_pane_id = cs.active_panes[cs.active_tab];
         if (self.pane_states.get(active_pane_id)) |active_state| {
-            // Find the active pane's region
             for (regions) |entry| {
                 if (entry.id == active_pane_id) {
-                    const inner_row = entry.region.row + 1 + active_state.grid.cursor_row;
-                    const inner_col = entry.region.col + 1 + active_state.grid.cursor_col;
+                    const cursor_row = entry.region.row + 1 + active_state.grid.cursor_row;
+                    const cursor_col = entry.region.col + 1 + active_state.grid.cursor_col;
                     var cursor_buf: [32]u8 = undefined;
                     const cursor_seq = std.fmt.bufPrint(&cursor_buf, "\x1b[{d};{d}H\x1b[?25h", .{
-                        inner_row + 1, inner_col + 1,
+                        cursor_row + 1, cursor_col + 1,
                     }) catch break;
-                    self.sendFrame(.render, cursor_seq) catch {};
+                    self.sendFrameTo(cs, .render, cursor_seq) catch {};
                     break;
                 }
             }
         }
 
         // Swap buffers
-        self.screen.swapBuffers();
+        cs.screen.swapBuffers();
     }
 
-    // ── sendDirtyRegions ──────────────────────────────────────────────────────
+    // ── sendDirtyRegionsTo ───────────────────────────────────────────────
 
-    fn sendDirtyRegions(self: *Server) void {
-        const cfd = self.client_fd orelse return;
-
-        const dirty = self.screen.getDirtyRegions(self.allocator) catch return;
+    fn sendDirtyRegionsTo(self: *Server, cs: *ClientState) void {
+        const dirty = cs.screen.getDirtyRegions(self.allocator) catch return;
         defer {
             for (dirty) |dr| self.allocator.free(dr.cells);
             self.allocator.free(dirty);
         }
         if (dirty.len == 0) return;
 
-        // Encode all dirty regions into a single render payload using escape sequences.
-        // Format: for each region, emit CUP + cell SGR+char sequences.
         var payload_list = std.array_list.Managed(u8).init(self.allocator);
         defer payload_list.deinit();
         const writer = payload_list.writer();
@@ -881,61 +960,60 @@ pub const Server = struct {
         for (dirty) |dr| {
             for (dr.cells, 0..) |cell, col_offset| {
                 const abs_col = dr.col + @as(u16, @intCast(col_offset));
-                // CUP: ESC[row+1;col+1H (1-based)
                 writer.print("\x1b[{d};{d}H", .{ dr.row + 1, abs_col + 1 }) catch continue;
                 render_mod.serializeCell(cell, writer) catch continue;
             }
         }
 
         if (payload_list.items.len == 0) return;
-        // Break into MAX_PAYLOAD_LEN chunks if needed
         var offset: usize = 0;
         while (offset < payload_list.items.len) {
             const chunk_end = @min(offset + protocol.MAX_PAYLOAD_LEN, payload_list.items.len);
-            const chunk = payload_list.items[offset..chunk_end];
-
-            var frame_buf: [protocol.HEADER_SIZE + protocol.MAX_PAYLOAD_LEN]u8 = undefined;
-            const frame_len = protocol.encodeFrame(&frame_buf, .render, chunk) catch break;
-            var sent: usize = 0;
-            while (sent < frame_len) {
-                const w = posix.write(cfd, frame_buf[sent..frame_len]) catch break;
-                if (w == 0) break;
-                sent += w;
-            }
+            self.sendFrameTo(cs, .render, payload_list.items[offset..chunk_end]) catch break;
             offset = chunk_end;
         }
     }
 
-    // ── sendFrame ─────────────────────────────────────────────────────────────
+    // ── sendFrameTo ──────────────────────────────────────────────────────
 
-    fn sendFrame(self: *Server, msg_type: protocol.MessageType, payload: []const u8) !void {
-        const cfd = self.client_fd orelse return;
+    fn sendFrameTo(_: *Server, cs: *ClientState, msg_type: protocol.MessageType, payload: []const u8) !void {
         var buf: [protocol.HEADER_SIZE + protocol.MAX_PAYLOAD_LEN]u8 = undefined;
         const n = try protocol.encodeFrame(&buf, msg_type, payload);
         var sent: usize = 0;
         while (sent < n) {
-            const w = try posix.write(cfd, buf[sent..n]);
+            const w = try posix.write(cs.fd, buf[sent..n]);
             if (w == 0) return error.BrokenPipe;
             sent += w;
         }
     }
 
-    // ── disconnectClient ──────────────────────────────────────────────────────
+    // ── disconnectClient ─────────────────────────────────────────────────
 
-    fn disconnectClient(self: *Server) void {
-        if (self.client_fd) |fd| {
-            const r = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
-            _ = r;
-            posix.close(fd);
-            self.client_fd = null;
+    fn disconnectClient(self: *Server, client_id: u16) void {
+        const cs = self.clients.get(client_id) orelse return;
+        _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, cs.fd, null);
+        posix.close(cs.fd);
+        cs.deinit();
+        _ = self.clients.remove(client_id);
+        if (self.active_client) |ac| {
+            if (ac == client_id) {
+                // Fall back to lowest ID client
+                self.active_client = null;
+                var it = self.clients.keyIterator();
+                var min_id: ?u16 = null;
+                while (it.next()) |k| {
+                    if (min_id == null or k.* < min_id.?) min_id = k.*;
+                }
+                self.active_client = min_id;
+            }
         }
     }
 
-    // ── destroyAllPanesInCurrentTab ───────────────────────────────────────────
+    // ── destroyAllPanesInTab ─────────────────────────────────────────────
 
-    fn destroyAllPanesInCurrentTab(self: *Server) void {
-        const active_tab = self.tab_manager.activeTab();
-        self.destroyPanesInNode(active_tab.pane_tree.root);
+    fn destroyAllPanesInTab(self: *Server, tab_idx: u8) void {
+        const tab = self.tab_manager.activeTab(tab_idx);
+        self.destroyPanesInNode(tab.pane_tree.root);
     }
 
     fn destroyPanesInNode(self: *Server, node: *pane_mod.LayoutNode) void {
@@ -1062,7 +1140,7 @@ test "ptyTag and isPtyTag" {
     const tag = ptyTag(id);
     try std.testing.expect(isPtyTag(tag));
     try std.testing.expect(!isPtyTag(TAG_LISTEN));
-    try std.testing.expect(!isPtyTag(TAG_CLIENT));
+    try std.testing.expect(!isPtyTag(TAG_CLIENT_BASE));
     try std.testing.expect(!isPtyTag(TAG_SIGNAL));
     try std.testing.expectEqual(id, paneIdFromTag(tag));
 }

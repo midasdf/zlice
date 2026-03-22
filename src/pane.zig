@@ -45,7 +45,6 @@ pub const LayoutNode = union(enum) {
 pub const PaneTree = struct {
     root: *LayoutNode,
     allocator: std.mem.Allocator,
-    active_pane: PaneId,
 
     /// Create a tree with a single root leaf pane using `initial_id`.
     pub fn init(allocator: std.mem.Allocator, initial_id: PaneId) !PaneTree {
@@ -54,7 +53,6 @@ pub const PaneTree = struct {
         return PaneTree{
             .root = root,
             .allocator = allocator,
-            .active_pane = initial_id,
         };
     }
 
@@ -137,9 +135,6 @@ pub const PaneTree = struct {
         );
         if (!found) return null;
 
-        if (self.active_pane == target_id) {
-            self.active_pane = sibling_id;
-        }
         return sibling_id;
     }
 
@@ -562,7 +557,6 @@ test "init creates single pane" {
     defer tree.deinit();
 
     try testing.expectEqual(@as(usize, 1), tree.paneCount());
-    try testing.expectEqual(@as(PaneId, 0), tree.active_pane);
 
     const regions = try tree.calculateRegions(full);
     defer testing.allocator.free(regions);

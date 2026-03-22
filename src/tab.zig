@@ -43,7 +43,6 @@ pub const Tab = struct {
 pub const TabManager = struct {
     tabs: [MAX_TABS]?Tab = [_]?Tab{null} ** MAX_TABS,
     count: u8 = 0,
-    active: u8 = 0,
     allocator: std.mem.Allocator,
 
     /// Create a TabManager with one initial tab named "Tab 1".
@@ -54,7 +53,6 @@ pub const TabManager = struct {
         tab.setName("Tab 1");
         mgr.tabs[0] = tab;
         mgr.count = 1;
-        mgr.active = 0;
         return mgr;
     }
 
@@ -93,77 +91,59 @@ pub const TabManager = struct {
 
         self.tabs[idx] = tab;
         self.count += 1;
-        self.active = idx;
         return idx;
     }
 
-    /// Close tab at `index`. Returns false if it would close the last tab.
-    /// Adjusts active index if the closed tab was active.
-    pub fn closeTab(self: *TabManager, index: u8) bool {
-        if (self.count <= 1) return false;
-        if (index >= MAX_TABS) return false;
-        if (self.tabs[index] == null) return false;
+    /// Close tab at `index`. Returns the nearest open tab index on success,
+    /// or null if it's the last tab (can't close).
+    pub fn closeTab(self: *TabManager, index: u8) ?u8 {
+        if (self.count <= 1) return null;
+        if (index >= MAX_TABS) return null;
+        if (self.tabs[index] == null) return null;
 
         self.tabs[index].?.pane_tree.deinit();
         self.tabs[index] = null;
         self.count -= 1;
 
-        // If the closed tab was active, move active to the nearest existing tab.
-        if (self.active == index) {
-            // Search backward first, then forward.
-            var found = false;
-            var i: i16 = @as(i16, @intCast(index)) - 1;
-            while (i >= 0) : (i -= 1) {
-                if (self.tabs[@intCast(i)] != null) {
-                    self.active = @intCast(i);
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                var j: u8 = index + 1;
-                while (j < MAX_TABS) : (j += 1) {
-                    if (self.tabs[j] != null) {
-                        self.active = j;
-                        break;
-                    }
-                }
-            }
+        // Find nearest: backward first, then forward.
+        var i: i16 = @as(i16, @intCast(index)) - 1;
+        while (i >= 0) : (i -= 1) {
+            if (self.tabs[@intCast(i)] != null) return @intCast(i);
         }
-        return true;
+        var j: u8 = index + 1;
+        while (j < MAX_TABS) : (j += 1) {
+            if (self.tabs[j] != null) return j;
+        }
+        return 0; // shouldn't reach here since count > 0
     }
 
-    /// Switch to the next existing tab (wraps around).
-    pub fn nextTab(self: *TabManager) void {
-        if (self.count <= 1) return;
-        var i: u8 = (self.active + 1) % MAX_TABS;
+    /// Return the next existing tab index from `current` (wraps around).
+    pub fn nextTab(self: *TabManager, current: u8) u8 {
+        if (self.count <= 1) return current;
+        var i: u8 = (current + 1) % MAX_TABS;
         var steps: u8 = 0;
         while (steps < MAX_TABS) : (steps += 1) {
-            if (self.tabs[i] != null) {
-                self.active = i;
-                return;
-            }
+            if (self.tabs[i] != null) return i;
             i = (i + 1) % MAX_TABS;
         }
+        return current;
     }
 
-    /// Switch to the previous existing tab (wraps around).
-    pub fn prevTab(self: *TabManager) void {
-        if (self.count <= 1) return;
-        var i: u8 = if (self.active == 0) MAX_TABS - 1 else self.active - 1;
+    /// Return the previous existing tab index from `current` (wraps around).
+    pub fn prevTab(self: *TabManager, current: u8) u8 {
+        if (self.count <= 1) return current;
+        var i: u8 = if (current == 0) MAX_TABS - 1 else current - 1;
         var steps: u8 = 0;
         while (steps < MAX_TABS) : (steps += 1) {
-            if (self.tabs[i] != null) {
-                self.active = i;
-                return;
-            }
+            if (self.tabs[i] != null) return i;
             i = if (i == 0) MAX_TABS - 1 else i - 1;
         }
+        return current;
     }
 
-    /// Return a pointer to the active tab.
-    pub fn activeTab(self: *TabManager) *Tab {
-        return &self.tabs[self.active].?;
+    /// Return a pointer to the tab at the given index.
+    pub fn activeTab(self: *TabManager, active: u8) *Tab {
+        return &self.tabs[active].?;
     }
 
     /// Return the number of open tabs.
@@ -181,7 +161,7 @@ test "init creates one tab" {
     defer mgr.deinit();
 
     try testing.expectEqual(@as(u8, 1), mgr.tabCount());
-    try testing.expectEqualStrings("Tab 1", mgr.activeTab().getName());
+    try testing.expectEqualStrings("Tab 1", mgr.activeTab(0).getName());
 }
 
 test "create multiple tabs" {
@@ -202,10 +182,10 @@ test "close tab" {
 
     // Close the first tab (index 0).
     const result = mgr.closeTab(0);
-    try testing.expect(result);
+    try testing.expect(result != null);
     try testing.expectEqual(@as(u8, 1), mgr.tabCount());
-    // Active should have shifted away from closed index.
-    try testing.expect(mgr.active != 0 or mgr.tabs[mgr.active] != null);
+    // The nearest tab should be valid.
+    try testing.expect(mgr.tabs[result.?] != null);
 }
 
 test "cannot close last tab" {
@@ -213,7 +193,7 @@ test "cannot close last tab" {
     defer mgr.deinit();
 
     const result = mgr.closeTab(0);
-    try testing.expect(!result);
+    try testing.expect(result == null);
     try testing.expectEqual(@as(u8, 1), mgr.tabCount());
 }
 
@@ -224,24 +204,21 @@ test "next/prev tab wraps" {
     _ = try mgr.createTab(1); // index 1
     _ = try mgr.createTab(2); // index 2
 
-    // Set active to the last occupied slot.
     // Tabs are at indices 0, 1, 2 (count == 3).
-    // createTab sets active to the new index each time, so active == 2.
-    try testing.expectEqual(@as(u8, 2), mgr.active);
 
     // next from index 2 should wrap to index 0.
-    mgr.nextTab();
-    try testing.expectEqual(@as(u8, 0), mgr.active);
+    const next = mgr.nextTab(2);
+    try testing.expectEqual(@as(u8, 0), next);
 
     // prev from index 0 should wrap to index 2.
-    mgr.prevTab();
-    try testing.expectEqual(@as(u8, 2), mgr.active);
+    const prev = mgr.prevTab(0);
+    try testing.expectEqual(@as(u8, 2), prev);
 }
 
 test "rename tab" {
     var mgr = try TabManager.init(testing.allocator);
     defer mgr.deinit();
 
-    mgr.activeTab().setName("my-session");
-    try testing.expectEqualStrings("my-session", mgr.activeTab().getName());
+    mgr.activeTab(0).setName("my-session");
+    try testing.expectEqualStrings("my-session", mgr.activeTab(0).getName());
 }
