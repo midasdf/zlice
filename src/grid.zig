@@ -754,7 +754,9 @@ pub const Grid = struct {
                     const cursor_canonical_idx = cursor_linear / 1_000_000;
                     if (cursor_canonical_idx == current_canonical and
                         cursor_in_canonical >= offset and
-                        cursor_in_canonical <= chunk_end)
+                        (cursor_in_canonical <= chunk_end or
+                        // Cursor can be past trimmed content (contentLen trims trailing spaces)
+                        chunk_end == line_cells.len))
                     {
                         // Cursor at chunk_end means it's at the right edge;
                         // if it's exactly at the boundary and there's more content,
@@ -854,17 +856,25 @@ pub const Grid = struct {
     }
 
     fn resizeHeight(self: *Grid, new_rows: u16) !void {
+        // Add rows if total is less than the new viewport height
         while (self.rows.items.len < new_rows) {
             try self.rows.append(self.allocator, try Row.init(self.allocator, self.cols, true));
         }
-        while (self.rows.items.len > new_rows) {
-            if (self.rows.pop()) |*r_ptr| {
-                var r = r_ptr.*;
-                r.deinit(self.allocator);
-            }
-        }
+        // Don't delete rows when viewport shrinks — excess rows become scrollback.
+        // The old code deleted all rows beyond new_rows (including scrollback),
+        // causing content loss on resize.
+
+        // Convert cursor from old viewport-relative to absolute, then back
+        const old_abs = self.absRow(self.cursor_row);
         self.viewport_rows = new_rows;
-        self.cursor_row = @min(self.cursor_row, @as(u16, @intCast(self.rows.items.len)) -| 1);
+        const total = self.rows.items.len;
+        const new_vp_start: usize = if (total > new_rows) total - new_rows else 0;
+        if (old_abs >= new_vp_start) {
+            self.cursor_row = @intCast(old_abs - new_vp_start);
+        } else {
+            // Cursor scrolled into scrollback; clamp to top of viewport
+            self.cursor_row = 0;
+        }
     }
 
     fn resizeSimple(self: *Grid, new_cols: u16, new_rows: u16) !void {
@@ -1013,13 +1023,17 @@ test "resize height only adds rows" {
     try std.testing.expectEqual(@as(u21, 'A'), grid.rows.items[0].cells[0].char);
 }
 
-test "resize height only removes rows" {
+test "resize height preserves rows as scrollback" {
     const allocator = std.testing.allocator;
     var grid = try Grid.init(allocator, 10, 5);
     defer grid.deinit();
 
     try grid.resize(10, 3);
-    try std.testing.expectEqual(@as(usize, 3), grid.rows.items.len);
+    // Total rows unchanged — the 2 excess rows become scrollback
+    try std.testing.expectEqual(@as(usize, 5), grid.rows.items.len);
+    try std.testing.expectEqual(@as(u16, 3), grid.viewport_rows);
+    // Scrollback: rows.len - viewport_rows = 2
+    try std.testing.expectEqual(@as(usize, 2), grid.scrollbackLen());
 }
 
 test "reflow preserves content through narrow-wide cycle" {
