@@ -425,6 +425,9 @@ pub const Server = struct {
                 cs.rows = hp.rows;
                 cs.screen.resize(hp.cols, hp.rows) catch {};
                 cs.screen.invalidate();
+                if (self.active_client == null) {
+                    self.active_client = client_id;
+                }
                 self.composeForClient(cs);
             },
             .input => {
@@ -477,6 +480,7 @@ pub const Server = struct {
                 _ = active_tab.pane_tree.splitPane(active_pane_id, .horizontal, new_id) catch return;
                 self.spawnPaneState(new_id) catch return;
                 cs.active_panes[cs.active_tab] = new_id;
+                self.invalidateAllClients();
                 self.composeAll();
             },
             .split_vertical => {
@@ -484,6 +488,7 @@ pub const Server = struct {
                 _ = active_tab.pane_tree.splitPane(active_pane_id, .vertical, new_id) catch return;
                 self.spawnPaneState(new_id) catch return;
                 cs.active_panes[cs.active_tab] = new_id;
+                self.invalidateAllClients();
                 self.composeAll();
             },
             .close_pane => {
@@ -497,6 +502,7 @@ pub const Server = struct {
                     }
                     _ = other_cs.*.scroll_offsets.remove(active_pane_id);
                 }
+                self.invalidateAllClients();
                 self.composeAll();
             },
             .focus_pane => {
@@ -519,6 +525,7 @@ pub const Server = struct {
                 const dir = std.meta.intToEnum(protocol.Direction, payload[0]) catch return;
                 const delta: i16 = @bitCast((@as(u16, payload[1]) << 8) | payload[2]);
                 active_tab.pane_tree.resizePane(active_pane_id, dir, delta);
+                self.invalidateAllClients();
                 self.composeAll();
             },
             .toggle_fullscreen => self.composeAll(),
@@ -528,6 +535,7 @@ pub const Server = struct {
                 self.spawnPaneState(new_pane_id) catch return;
                 cs.active_tab = new_tab_idx;
                 cs.active_panes[new_tab_idx] = new_pane_id;
+                self.invalidateAllClients();
                 self.composeAll();
             },
             .close_tab => {
@@ -541,14 +549,17 @@ pub const Server = struct {
                         other_cs.*.active_tab = nearest;
                     }
                 }
+                self.invalidateAllClients();
                 self.composeAll();
             },
             .next_tab => {
                 cs.active_tab = self.tab_manager.nextTab(cs.active_tab);
+                cs.screen.invalidate();
                 self.composeForClient(cs);
             },
             .prev_tab => {
                 cs.active_tab = self.tab_manager.prevTab(cs.active_tab);
+                cs.screen.invalidate();
                 self.composeForClient(cs);
             },
             .switch_tab => {
@@ -556,6 +567,7 @@ pub const Server = struct {
                 const target = payload[0];
                 if (target < tab_mod.MAX_TABS and self.tab_manager.tabs[target] != null) {
                     cs.active_tab = target;
+                    cs.screen.invalidate();
                     self.composeForClient(cs);
                 }
             },
@@ -757,6 +769,18 @@ pub const Server = struct {
         }
         if (any_visible) {
             self.composeAll();
+        }
+    }
+
+    // ── invalidateAllClients ─────────────────────────────────────────────
+
+    /// Mark all client screens as fully dirty so the next compose sends a
+    /// complete redraw.  Must be called before composeAll() whenever the
+    /// pane layout changes (split, close, tab switch, resize_pane).
+    fn invalidateAllClients(self: *Server) void {
+        var it = self.clients.valueIterator();
+        while (it.next()) |client| {
+            client.*.screen.invalidate();
         }
     }
 
