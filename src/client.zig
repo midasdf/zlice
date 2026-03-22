@@ -173,8 +173,12 @@ pub fn run(socket_path: [:0]const u8) !void {
             switch (ev.data.u64) {
                 FD_STDIN => {
                     var input_buf: [256]u8 = undefined;
-                    const n_read = posix.read(posix.STDIN_FILENO, &input_buf) catch break;
+                    const n_read = posix.read(posix.STDIN_FILENO, &input_buf) catch |err| {
+                        std.log.err("zplit-client: stdin read error: {}", .{err});
+                        break;
+                    };
                     if (n_read == 0) {
+                        std.log.err("zplit-client: stdin EOF", .{});
                         running = false;
                         break;
                     }
@@ -183,18 +187,26 @@ pub fn run(socket_path: [:0]const u8) !void {
                         &input_parser,
                         &mode_state,
                         sock_fd,
-                    ) catch break;
+                    ) catch |err| {
+                        std.log.err("zplit-client: handleStdinBytes failed: {}", .{err});
+                        break;
+                    };
                 },
 
                 FD_SOCKET => {
                     // Append into recv_buf
                     const space = recv_buf.len - recv_len;
-                    if (space == 0) return error.ReceiveBufferFull;
-                    const n_read = posix.read(sock_fd, recv_buf[recv_len..]) catch {
+                    if (space == 0) {
+                        std.log.err("zplit-client: receive buffer full, exiting", .{});
+                        return error.ReceiveBufferFull;
+                    }
+                    const n_read = posix.read(sock_fd, recv_buf[recv_len..]) catch |err| {
+                        std.log.err("zplit-client: socket read error: {}, exiting", .{err});
                         running = false;
                         break;
                     };
                     if (n_read == 0) {
+                        std.log.err("zplit-client: server closed connection (EOF)", .{});
                         running = false;
                         break;
                     }
@@ -210,12 +222,17 @@ pub fn run(socket_path: [:0]const u8) !void {
                         if (recv_len < frame_end) break; // need more data
 
                         const payload = recv_buf[consumed + protocol.HEADER_SIZE .. frame_end];
-                        const keep = try handleServerFrame(
+                        const keep = handleServerFrame(
                             hdr.msg_type,
                             payload,
                             stdout,
-                        );
+                        ) catch |err| {
+                            std.log.err("zplit-client: handleServerFrame failed: {}, exiting", .{err});
+                            running = false;
+                            break;
+                        };
                         if (!keep) {
+                            std.log.err("zplit-client: server sent exit", .{});
                             running = false;
                             break;
                         }
@@ -236,11 +253,17 @@ pub fn run(socket_path: [:0]const u8) !void {
                     const new_size = terminal.getSize(posix.STDOUT_FILENO) catch
                         terminal.TerminalSize{ .cols = 80, .rows = 24 };
                     var resize_payload: [4]u8 = undefined;
-                    _ = try protocol.encodeResize(&resize_payload, .{
+                    _ = protocol.encodeResize(&resize_payload, .{
                         .cols = new_size.cols,
                         .rows = new_size.rows,
-                    });
-                    try sendFrame(sock_fd, .resize, &resize_payload);
+                    }) catch {
+                        std.log.err("zplit-client: encodeResize failed", .{});
+                        continue;
+                    };
+                    sendFrame(sock_fd, .resize, &resize_payload) catch |err| {
+                        std.log.err("zplit-client: sendFrame resize failed: {}", .{err});
+                        continue;
+                    };
                 },
 
                 else => {},
