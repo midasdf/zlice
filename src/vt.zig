@@ -8,6 +8,20 @@ pub const Color = union(enum) {
     default,
     idx: u8,
     rgb: struct { r: u8, g: u8, b: u8 },
+
+    pub inline fn eql(a: Color, b: Color) bool {
+        return switch (a) {
+            .default => b == .default,
+            .idx => |i| switch (b) {
+                .idx => |j| i == j,
+                else => false,
+            },
+            .rgb => |c| switch (b) {
+                .rgb => |d| c.r == d.r and c.g == d.g and c.b == d.b,
+                else => false,
+            },
+        };
+    }
 };
 
 pub const Attr = packed struct {

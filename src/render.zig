@@ -10,10 +10,10 @@ pub const Cell = struct {
     bg: vt.Color = .default,
     attr: vt.Attr = .{},
 
-    pub fn eql(a: Cell, b: Cell) bool {
+    pub inline fn eql(a: Cell, b: Cell) bool {
         return a.char == b.char and
-            std.meta.eql(a.fg, b.fg) and
-            std.meta.eql(a.bg, b.bg) and
+            a.fg.eql(b.fg) and
+            a.bg.eql(b.bg) and
             @as(u8, @bitCast(a.attr)) == @as(u8, @bitCast(b.attr));
     }
 };
@@ -186,9 +186,12 @@ pub const Screen = struct {
         }
     }
 
-    /// Copy back buffer to front buffer (call after dirty regions have been sent).
+    /// Swap front and back buffer pointers (O(1) instead of O(rows*cols) memcpy).
+    /// Safe because composeForClient always calls clear() at the start of each frame.
     pub fn swapBuffers(self: *Screen) void {
-        @memcpy(self.front, self.back);
+        const tmp = self.front;
+        self.front = self.back;
+        self.back = tmp;
     }
 
     /// Invalidate front buffer so next getDirtyRegions returns everything as dirty.
@@ -378,9 +381,13 @@ test "no dirty regions when buffers match" {
     var screen = try Screen.init(testing.allocator, 80, 24);
     defer screen.deinit();
 
-    // Modify back buffer, then swap so they match.
+    // Simulate real compose cycle: write to back, swap (pointer exchange),
+    // then write same content to back again → no dirty regions.
     screen.cellAt(0, 0).* = Cell{ .char = 'Z' };
     screen.swapBuffers();
+    // After swap: front has 'Z', back (old front) is blank.
+    // Write same content to new back buffer.
+    screen.cellAt(0, 0).* = Cell{ .char = 'Z' };
 
     const regions = try screen.getDirtyRegions(testing.allocator);
     defer {

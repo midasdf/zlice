@@ -28,10 +28,11 @@ pub const Row = struct {
     pub fn contentLen(self: *const Row) usize {
         var i: usize = self.cells.len;
         while (i > 0) {
-            if (self.cells[i - 1].char != ' ' or
-                !std.meta.eql(self.cells[i - 1].fg, vt.Color.default) or
-                !std.meta.eql(self.cells[i - 1].bg, vt.Color.default) or
-                @as(u8, @bitCast(self.cells[i - 1].attr)) != 0)
+            const c = self.cells[i - 1];
+            if (c.char != ' ' or
+                !c.fg.eql(vt.Color.default) or
+                !c.bg.eql(vt.Color.default) or
+                @as(u8, @bitCast(c.attr)) != 0)
             {
                 break;
             }

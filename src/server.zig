@@ -53,6 +53,29 @@ fn clientIdFromTag(tag: u64) u16 {
     return @intCast(tag & 0xFFFF);
 }
 
+// ── Formatting helpers ────────────────────────────────────────────────────────
+
+/// Fast decimal formatting for u16 values (avoids std.fmt overhead in hot path).
+/// Caller must ensure buf.len >= 5 (max digits for u16 = 65535).
+fn writeDecimal(buf: []u8, val: u16) usize {
+    if (val == 0) {
+        buf[0] = '0';
+        return 1;
+    }
+    var v = val;
+    var tmp: [5]u8 = undefined;
+    var len: usize = 0;
+    while (v > 0) : (len += 1) {
+        tmp[len] = '0' + @as(u8, @intCast(v % 10));
+        v /= 10;
+    }
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        buf[i] = tmp[len - 1 - i];
+    }
+    return len;
+}
+
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 const MAX_CLIENTS: u8 = 8;
@@ -741,7 +764,7 @@ pub const Server = struct {
 
     fn handlePtyOutput(self: *Server, pane_id: pane_mod.PaneId) void {
         const state = self.pane_states.get(pane_id) orelse return;
-        var buf: [4096]u8 = undefined;
+        var buf: [16384]u8 = undefined;
         const n = state.pty.read(&buf) catch {
             return; // Error reading — HUP handler will clean up
         };
@@ -898,21 +921,22 @@ pub const Server = struct {
             const inner_rows = if (region.rows > 2) region.rows - 2 else 0;
             const inner_cols = if (region.cols > 2) region.cols - 2 else 0;
 
+            // Hoist scroll offset computation out of the inner cell loop
+            const max_scroll: u16 = @intCast(@min(pane_state.grid.scrollbackLen(), std.math.maxInt(u16)));
+            const eff_scroll = @min(cs.getScrollOffset(entry.id), max_scroll);
+            const eff_inner_rows = @min(inner_rows, pane_state.grid.viewport_rows);
+            const eff_inner_cols = @min(inner_cols, pane_state.grid.cols);
+
             var r: u16 = 0;
-            while (r < inner_rows) : (r += 1) {
-                if (r >= pane_state.grid.viewport_rows) break;
+            while (r < eff_inner_rows) : (r += 1) {
                 const screen_row = inner_row + r;
                 if (screen_row >= cs.screen.rows) break;
 
                 var c: u16 = 0;
-                while (c < inner_cols) : (c += 1) {
-                    if (c >= pane_state.grid.cols) break;
+                while (c < eff_inner_cols) : (c += 1) {
                     const screen_col = inner_col + c;
                     if (screen_col >= cs.screen.cols) break;
 
-                    // Apply scroll offset from per-client state
-                    const max_scroll: u16 = @intCast(@min(pane_state.grid.scrollbackLen(), std.math.maxInt(u16)));
-                    const eff_scroll = @min(cs.getScrollOffset(entry.id), max_scroll);
                     const vt_cell = pane_state.grid.getCellScrolled(r, c, eff_scroll);
 
                     const screen_cell = cs.screen.cellAt(screen_row, screen_col);
@@ -969,32 +993,188 @@ pub const Server = struct {
 
     // ── sendDirtyRegionsTo ───────────────────────────────────────────────
 
+    /// Optimized rendering pipeline:
+    /// - Inline front/back buffer comparison (zero allocation for dirty regions)
+    /// - SGR delta encoding (skip unchanged styles between consecutive cells)
+    /// - Fixed stack buffer with chunked sends (no dynamic allocation)
+    /// - Cursor position elision (skip CUP when cursor naturally advances)
     fn sendDirtyRegionsTo(self: *Server, cs: *ClientState) void {
-        const dirty = cs.screen.getDirtyRegions(self.allocator) catch return;
-        defer {
-            for (dirty) |dr| self.allocator.free(dr.cells);
-            self.allocator.free(dirty);
-        }
-        if (dirty.len == 0) return;
+        const front = cs.screen.front;
+        const back = cs.screen.back;
+        const cols = cs.screen.cols;
+        const rows = cs.screen.rows;
+        const Cell = render_mod.Cell;
 
-        var payload_list = std.array_list.Managed(u8).init(self.allocator);
-        defer payload_list.deinit();
-        const writer = payload_list.writer();
+        // Fixed output buffer — flush when approaching capacity
+        var buf: [32768]u8 = undefined;
+        var pos: usize = 0;
 
-        for (dirty) |dr| {
-            for (dr.cells, 0..) |cell, col_offset| {
-                const abs_col = dr.col + @as(u16, @intCast(col_offset));
-                writer.print("\x1b[{d};{d}H", .{ dr.row + 1, abs_col + 1 }) catch continue;
-                render_mod.serializeCell(cell, writer) catch continue;
+        // SGR state tracking for delta encoding
+        var last_fg: vt_mod.Color = .default;
+        var last_bg: vt_mod.Color = .default;
+        var last_attr: u8 = 0;
+        var sgr_valid = false;
+
+        // Cursor position tracking — skip CUP when cursor naturally advances
+        var cur_row: u16 = 0xFFFF;
+        var cur_col: u16 = 0xFFFF;
+
+        var row: u16 = 0;
+        while (row < rows) : (row += 1) {
+            const row_off = @as(usize, row) * @as(usize, cols);
+            var col: u16 = 0;
+            while (col < cols) : (col += 1) {
+                const idx = row_off + col;
+                if (Cell.eql(front[idx], back[idx])) continue;
+
+                const cell = back[idx];
+                // Skip spacer cells (second cell of wide characters)
+                if (cell.char == 0) {
+                    cur_row = row;
+                    cur_col = col + 1;
+                    continue;
+                }
+
+                // Flush if near capacity (worst case ~60 bytes per cell)
+                if (pos + 80 > buf.len) {
+                    self.sendFrameTo(cs, .render, buf[0..pos]) catch return;
+                    pos = 0;
+                }
+
+                // CUP: only emit when cursor isn't at expected position
+                if (row != cur_row or col != cur_col) {
+                    buf[pos] = '\x1b';
+                    buf[pos + 1] = '[';
+                    pos += 2;
+                    pos += writeDecimal(buf[pos..], row + 1);
+                    buf[pos] = ';';
+                    pos += 1;
+                    pos += writeDecimal(buf[pos..], col + 1);
+                    buf[pos] = 'H';
+                    pos += 1;
+                }
+
+                // SGR: only emit when style differs from last emitted cell
+                const cell_attr: u8 = @bitCast(cell.attr);
+                const style_same = sgr_valid and
+                    cell.fg.eql(last_fg) and
+                    cell.bg.eql(last_bg) and
+                    cell_attr == last_attr;
+
+                if (!style_same) {
+                    // Emit full SGR reset + active styles
+                    buf[pos] = '\x1b';
+                    buf[pos + 1] = '[';
+                    buf[pos + 2] = '0';
+                    pos += 3;
+
+                    // Foreground
+                    switch (cell.fg) {
+                        .default => {},
+                        .idx => |i| {
+                            buf[pos] = ';';
+                            pos += 1;
+                            if (i < 8) {
+                                pos += writeDecimal(buf[pos..], @as(u16, 30) + @as(u16, i));
+                            } else if (i < 16) {
+                                pos += writeDecimal(buf[pos..], @as(u16, 90) + @as(u16, i) - 8);
+                            } else {
+                                @memcpy(buf[pos..][0..4], "38;5");
+                                pos += 4;
+                                buf[pos] = ';';
+                                pos += 1;
+                                pos += writeDecimal(buf[pos..], @as(u16, i));
+                            }
+                        },
+                        .rgb => |c| {
+                            @memcpy(buf[pos..][0..5], ";38;2");
+                            pos += 5;
+                            buf[pos] = ';';
+                            pos += 1;
+                            pos += writeDecimal(buf[pos..], @as(u16, c.r));
+                            buf[pos] = ';';
+                            pos += 1;
+                            pos += writeDecimal(buf[pos..], @as(u16, c.g));
+                            buf[pos] = ';';
+                            pos += 1;
+                            pos += writeDecimal(buf[pos..], @as(u16, c.b));
+                        },
+                    }
+
+                    // Background
+                    switch (cell.bg) {
+                        .default => {},
+                        .idx => |i| {
+                            buf[pos] = ';';
+                            pos += 1;
+                            if (i < 8) {
+                                pos += writeDecimal(buf[pos..], @as(u16, 40) + @as(u16, i));
+                            } else if (i < 16) {
+                                pos += writeDecimal(buf[pos..], @as(u16, 100) + @as(u16, i) - 8);
+                            } else {
+                                @memcpy(buf[pos..][0..4], "48;5");
+                                pos += 4;
+                                buf[pos] = ';';
+                                pos += 1;
+                                pos += writeDecimal(buf[pos..], @as(u16, i));
+                            }
+                        },
+                        .rgb => |c| {
+                            @memcpy(buf[pos..][0..5], ";48;2");
+                            pos += 5;
+                            buf[pos] = ';';
+                            pos += 1;
+                            pos += writeDecimal(buf[pos..], @as(u16, c.r));
+                            buf[pos] = ';';
+                            pos += 1;
+                            pos += writeDecimal(buf[pos..], @as(u16, c.g));
+                            buf[pos] = ';';
+                            pos += 1;
+                            pos += writeDecimal(buf[pos..], @as(u16, c.b));
+                        },
+                    }
+
+                    // Attributes
+                    const a = cell.attr;
+                    if (a.bold) { @memcpy(buf[pos..][0..2], ";1"); pos += 2; }
+                    if (a.dim) { @memcpy(buf[pos..][0..2], ";2"); pos += 2; }
+                    if (a.italic) { @memcpy(buf[pos..][0..2], ";3"); pos += 2; }
+                    if (a.underline) { @memcpy(buf[pos..][0..2], ";4"); pos += 2; }
+                    if (a.blink) { @memcpy(buf[pos..][0..2], ";5"); pos += 2; }
+                    if (a.inverse) { @memcpy(buf[pos..][0..2], ";7"); pos += 2; }
+                    if (a.hidden) { @memcpy(buf[pos..][0..2], ";8"); pos += 2; }
+                    if (a.strikethrough) { @memcpy(buf[pos..][0..2], ";9"); pos += 2; }
+
+                    buf[pos] = 'm';
+                    pos += 1;
+
+                    last_fg = cell.fg;
+                    last_bg = cell.bg;
+                    last_attr = cell_attr;
+                    sgr_valid = true;
+                }
+
+                // UTF-8 encode the character
+                const utf8_len = std.unicode.utf8Encode(cell.char, buf[pos..][0..4]) catch {
+                    @memcpy(buf[pos..][0..3], "\xef\xbf\xbd");
+                    pos += 3;
+                    cur_row = row;
+                    cur_col = col + 1;
+                    continue;
+                };
+                pos += utf8_len;
+
+                // Advance tracked cursor by 1. For wide (2-cell) chars, the next
+                // iteration handles the spacer cell (char==0) which advances by 1
+                // more, giving a total advancement of 2. This relies on
+                // composeForClient placing spacer cells correctly.
+                cur_row = row;
+                cur_col = col + 1;
             }
         }
 
-        if (payload_list.items.len == 0) return;
-        var offset: usize = 0;
-        while (offset < payload_list.items.len) {
-            const chunk_end = @min(offset + protocol.MAX_PAYLOAD_LEN, payload_list.items.len);
-            self.sendFrameTo(cs, .render, payload_list.items[offset..chunk_end]) catch break;
-            offset = chunk_end;
+        if (pos > 0) {
+            self.sendFrameTo(cs, .render, buf[0..pos]) catch {};
         }
     }
 
