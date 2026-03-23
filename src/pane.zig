@@ -431,22 +431,32 @@ fn collectRegions(
 }
 
 /// Divide `region` by `ratio` (fraction for first) in `dir`.
+/// Adjacent panes share their border: the second pane overlaps the first by
+/// 1 column (horizontal) or 1 row (vertical), so a single border line
+/// separates the two panes instead of a double border.
 fn splitRegion(region: Region, dir: SplitDir, ratio: f32) struct { Region, Region } {
     switch (dir) {
         .horizontal => {
             // Split left/right: first gets `ratio` of cols.
-            const first_cols: u16 = @intFromFloat(@round(@as(f32, @floatFromInt(region.cols)) * ratio));
-            const clamped_first = @max(1, @min(first_cols, region.cols -| 1));
-            const second_cols = region.cols - clamped_first;
+            // Subtract 1 from total to account for the shared border column,
+            // then distribute the remaining space by ratio.
+            const available = region.cols -| 1; // space minus 1 shared border
+            const first_content: u16 = @intFromFloat(@round(@as(f32, @floatFromInt(available)) * ratio));
+            const clamped_first = @max(1, @min(first_content, available -| 1));
+            // First pane includes left border + content + shared border
+            const first_cols = clamped_first + 1;
+            // Second pane starts at the shared border column (overlap by 1)
+            const second_start = region.col + first_cols - 1;
+            const second_cols = region.cols - first_cols + 1;
             const first = Region{
                 .row = region.row,
                 .col = region.col,
                 .rows = region.rows,
-                .cols = clamped_first,
+                .cols = first_cols,
             };
             const second = Region{
                 .row = region.row,
-                .col = region.col + clamped_first,
+                .col = second_start,
                 .rows = region.rows,
                 .cols = second_cols,
             };
@@ -454,17 +464,21 @@ fn splitRegion(region: Region, dir: SplitDir, ratio: f32) struct { Region, Regio
         },
         .vertical => {
             // Split top/bottom: first gets `ratio` of rows.
-            const first_rows: u16 = @intFromFloat(@round(@as(f32, @floatFromInt(region.rows)) * ratio));
-            const clamped_first = @max(1, @min(first_rows, region.rows -| 1));
-            const second_rows = region.rows - clamped_first;
+            // Same shared-border approach for rows.
+            const available = region.rows -| 1;
+            const first_content: u16 = @intFromFloat(@round(@as(f32, @floatFromInt(available)) * ratio));
+            const clamped_first = @max(1, @min(first_content, available -| 1));
+            const first_rows = clamped_first + 1;
+            const second_start = region.row + first_rows - 1;
+            const second_rows = region.rows - first_rows + 1;
             const first = Region{
                 .row = region.row,
                 .col = region.col,
-                .rows = clamped_first,
+                .rows = first_rows,
                 .cols = region.cols,
             };
             const second = Region{
-                .row = region.row + clamped_first,
+                .row = second_start,
                 .col = region.col,
                 .rows = second_rows,
                 .cols = region.cols,
@@ -592,10 +606,12 @@ test "horizontal split" {
     // Both panes share the same rows.
     try testing.expectEqual(full.rows, r0.rows);
     try testing.expectEqual(full.rows, r1.rows);
-    // Columns are side by side and together sum to full.cols.
+    // Columns overlap by 1 (shared border) and together cover full.cols.
     try testing.expectEqual(full.col, r0.col);
-    try testing.expectEqual(r0.col + r0.cols, r1.col);
-    try testing.expectEqual(full.cols, r0.cols + r1.cols);
+    // Second pane starts 1 col before first pane ends (shared border).
+    try testing.expectEqual(r0.col + r0.cols - 1, r1.col);
+    // Total coverage: first.cols + second.cols - 1 (shared) == full.cols
+    try testing.expectEqual(full.cols, r0.cols + r1.cols - 1);
 }
 
 test "vertical split" {
@@ -620,10 +636,10 @@ test "vertical split" {
     // Both panes share the same cols.
     try testing.expectEqual(full.cols, r0.cols);
     try testing.expectEqual(full.cols, r1.cols);
-    // Rows are stacked.
+    // Rows overlap by 1 (shared border).
     try testing.expectEqual(full.row, r0.row);
-    try testing.expectEqual(r0.row + r0.rows, r1.row);
-    try testing.expectEqual(full.rows, r0.rows + r1.rows);
+    try testing.expectEqual(r0.row + r0.rows - 1, r1.row);
+    try testing.expectEqual(full.rows, r0.rows + r1.rows - 1);
 }
 
 test "nested split" {
