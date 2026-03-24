@@ -50,37 +50,37 @@ fn modeInfo(m: mode_mod.Mode) ModeInfo {
             .label = " NORMAL ",
             .fg = COLOR_BLACK,
             .bg = COLOR_GREEN,
-            .hint = "Ctrl+p \xe2\x86\x92 Pane | Ctrl+t \xe2\x86\x92 Tab | Ctrl+s \xe2\x86\x92 Scroll | Ctrl+o \xe2\x86\x92 Session | Ctrl+g \xe2\x86\x92 Lock",
+            .hint = "Ctrl+p Pane\xe2\x94\x82Ctrl+t Tab\xe2\x94\x82Ctrl+s Scroll\xe2\x94\x82Ctrl+o Session\xe2\x94\x82Ctrl+g Lock",
         },
         .pane => .{
             .label = " PANE ",
             .fg = COLOR_BLACK,
             .bg = COLOR_BLUE,
-            .hint = "\xe2\x86\x90 \xe2\x86\x93 \xe2\x86\x91 \xe2\x86\x92 Move | n New | v VSplit | x Close | Esc Normal",
+            .hint = "\xe2\x86\x90 \xe2\x86\x93 \xe2\x86\x91 \xe2\x86\x92 Move\xe2\x94\x82n New\xe2\x94\x82v VSplit\xe2\x94\x82x Close\xe2\x94\x82Esc Normal",
         },
         .tab => .{
             .label = " TAB ",
             .fg = COLOR_BLACK,
             .bg = COLOR_MAGENTA,
-            .hint = "\xe2\x86\x90 \xe2\x86\x92 Switch | n New | x Close | r Rename | Esc Normal",
+            .hint = "\xe2\x86\x90 \xe2\x86\x92 Switch\xe2\x94\x82n New\xe2\x94\x82x Close\xe2\x94\x82r Rename\xe2\x94\x82Esc Normal",
         },
         .scroll => .{
             .label = " SCROLL ",
             .fg = COLOR_BLACK,
             .bg = COLOR_YELLOW,
-            .hint = "\xe2\x86\x91 \xe2\x86\x93 Line | u d Page | Esc Normal",
+            .hint = "\xe2\x86\x91 \xe2\x86\x93 Line\xe2\x94\x82u d Page\xe2\x94\x82Esc Normal",
         },
         .session => .{
             .label = " SESSION ",
             .fg = COLOR_BLACK,
             .bg = COLOR_RED,
-            .hint = "d Detach | q Quit | Esc Normal",
+            .hint = "d Detach\xe2\x94\x82q Quit\xe2\x94\x82Esc Normal",
         },
         .locked => .{
             .label = " LOCKED ",
             .fg = COLOR_BLACK,
             .bg = COLOR_DARK_GREY,
-            .hint = "Ctrl+g \xe2\x86\x92 Unlock",
+            .hint = "Ctrl+g Unlock",
         },
     };
 }
@@ -142,7 +142,7 @@ pub fn renderStatusBar(
     writeString(cells, &offset, info.label, info.fg, info.bg);
 
     // ── Separator ─────────────────────────────────────────────────────────────
-    writeString(cells, &offset, " \xe2\x94\x82 ", SEP_FG, BAR_BG);
+    writeString(cells, &offset, "\xe2\x94\x82", SEP_FG, BAR_BG);
 
     // ── Middle: key hints ─────────────────────────────────────────────────────
     writeString(cells, &offset, info.hint, HINT_FG, BAR_BG);
