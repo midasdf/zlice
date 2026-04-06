@@ -449,11 +449,17 @@ pub const Server = struct {
                 cs.rows = hp.rows;
                 cs.screen.resize(hp.cols, hp.rows) catch {};
                 cs.screen.invalidate();
-                // Initialize active_panes for all existing tabs
+                // Initialize active_panes for all existing tabs and pick a valid active_tab
+                var first_open_tab: ?u8 = null;
                 for (self.tab_manager.tabs, 0..) |maybe_tab, i| {
                     if (maybe_tab) |t| {
-                        cs.active_panes[@intCast(i)] = pane_mod.firstLeafId(t.pane_tree.root);
+                        const tab_idx: u8 = @intCast(i);
+                        cs.active_panes[tab_idx] = pane_mod.firstLeafId(t.pane_tree.root);
+                        if (first_open_tab == null) first_open_tab = tab_idx;
                     }
+                }
+                if (first_open_tab) |tab_idx| {
+                    cs.active_tab = tab_idx;
                 }
                 if (self.active_client == null) {
                     self.active_client = client_id;
@@ -576,6 +582,8 @@ pub const Server = struct {
                 // Reject closing the last tab before destroying any state
                 if (self.tab_manager.tabCount() <= 1) return;
                 const closed_tab = cs.active_tab;
+                // Clean up per-pane client state (scroll_offsets) before destroying
+                self.cleanupClientStateForTab(closed_tab);
                 self.destroyAllPanesInTab(closed_tab);
                 const nearest = self.tab_manager.closeTab(closed_tab) orelse return;
                 // Update ALL clients viewing the closed tab
@@ -1004,6 +1012,11 @@ pub const Server = struct {
 
         // Swap buffers
         cs.screen.swapBuffers();
+
+        // Disconnect clients that failed to write during this render
+        if (cs.write_failed) {
+            self.sweepFailedClients();
+        }
     }
 
     // ── sendDirtyRegionsTo ───────────────────────────────────────────────
@@ -1201,6 +1214,9 @@ pub const Server = struct {
         var sent: usize = 0;
         while (sent < n) {
             const w = posix.write(cs.fd, buf[sent..n]) catch |err| {
+                // WouldBlock before any data sent = transient backpressure, skip frame
+                // WouldBlock after partial send = protocol stream corrupted, must disconnect
+                if (err == error.WouldBlock and sent == 0) return err;
                 cs.write_failed = true;
                 return err;
             };
@@ -1252,6 +1268,29 @@ pub const Server = struct {
         }
         for (to_remove[0..count]) |cid| {
             self.disconnectClient(cid);
+        }
+    }
+
+    // ── cleanupClientStateForTab ────────────────────────────────────────
+
+    /// Remove scroll_offsets entries for all panes in the given tab from every client.
+    fn cleanupClientStateForTab(self: *Server, tab_idx: u8) void {
+        const tab = self.tab_manager.activeTab(tab_idx);
+        var cit = self.clients.valueIterator();
+        while (cit.next()) |client_cs| {
+            self.removeScrollOffsetsInNode(client_cs.*, tab.pane_tree.root);
+        }
+    }
+
+    fn removeScrollOffsetsInNode(self: *Server, cs_ptr: *ClientState, node: *pane_mod.LayoutNode) void {
+        switch (node.*) {
+            .leaf => |l| {
+                _ = cs_ptr.scroll_offsets.remove(l.id);
+            },
+            .split => |s| {
+                self.removeScrollOffsetsInNode(cs_ptr, s.first);
+                self.removeScrollOffsetsInNode(cs_ptr, s.second);
+            },
         }
     }
 
