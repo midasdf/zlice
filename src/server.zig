@@ -134,6 +134,7 @@ pub const ClientState = struct {
     mode: mode_mod.Mode = .normal,
     recv_buf: [RECV_BUF_SIZE]u8 = undefined,
     recv_len: usize = 0,
+    write_failed: bool = false,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, id: u16, fd: posix.fd_t) !*ClientState {
@@ -347,7 +348,7 @@ pub const Server = struct {
 
                 if (tag == TAG_LISTEN) {
                     // Accept a new client connection
-                    const new_fd = posix.accept(self.listen_fd, null, null, posix.SOCK.CLOEXEC) catch continue;
+                    const new_fd = posix.accept(self.listen_fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch continue;
                     if (self.clients.count() >= MAX_CLIENTS) {
                         posix.close(new_fd);
                         continue;
@@ -448,6 +449,12 @@ pub const Server = struct {
                 cs.rows = hp.rows;
                 cs.screen.resize(hp.cols, hp.rows) catch {};
                 cs.screen.invalidate();
+                // Initialize active_panes for all existing tabs
+                for (self.tab_manager.tabs, 0..) |maybe_tab, i| {
+                    if (maybe_tab) |t| {
+                        cs.active_panes[@intCast(i)] = pane_mod.firstLeafId(t.pane_tree.root);
+                    }
+                }
                 if (self.active_client == null) {
                     self.active_client = client_id;
                 }
@@ -557,15 +564,21 @@ pub const Server = struct {
                 const new_tab_idx = self.tab_manager.createTab(new_pane_id) catch return;
                 self.spawnPaneState(new_pane_id) catch return;
                 cs.active_tab = new_tab_idx;
-                cs.active_panes[new_tab_idx] = new_pane_id;
+                // Propagate new tab's focused pane to ALL clients
+                var it = self.clients.valueIterator();
+                while (it.next()) |other_cs| {
+                    other_cs.*.active_panes[new_tab_idx] = new_pane_id;
+                }
                 self.invalidateAllClients();
                 self.composeAll();
             },
             .close_tab => {
-                self.destroyAllPanesInTab(cs.active_tab);
-                const nearest = self.tab_manager.closeTab(cs.active_tab) orelse return;
-                // Update ALL clients viewing the closed tab
+                // Reject closing the last tab before destroying any state
+                if (self.tab_manager.tabCount() <= 1) return;
                 const closed_tab = cs.active_tab;
+                self.destroyAllPanesInTab(closed_tab);
+                const nearest = self.tab_manager.closeTab(closed_tab) orelse return;
+                // Update ALL clients viewing the closed tab
                 var it = self.clients.valueIterator();
                 while (it.next()) |other_cs| {
                     if (other_cs.*.active_tab == closed_tab) {
@@ -822,6 +835,8 @@ pub const Server = struct {
         while (it.next()) |cs| {
             self.composeForClient(cs.*);
         }
+        // Disconnect clients that failed to write (corrupted protocol stream)
+        self.sweepFailedClients();
     }
 
     // ── resizePtysForClient ──────────────────────────────────────────────
@@ -1185,8 +1200,14 @@ pub const Server = struct {
         const n = try protocol.encodeFrame(&buf, msg_type, payload);
         var sent: usize = 0;
         while (sent < n) {
-            const w = try posix.write(cs.fd, buf[sent..n]);
-            if (w == 0) return error.BrokenPipe;
+            const w = posix.write(cs.fd, buf[sent..n]) catch |err| {
+                cs.write_failed = true;
+                return err;
+            };
+            if (w == 0) {
+                cs.write_failed = true;
+                return error.BrokenPipe;
+            }
             sent += w;
         }
     }
@@ -1210,6 +1231,27 @@ pub const Server = struct {
                 }
                 self.active_client = min_id;
             }
+        }
+    }
+
+    // ── sweepFailedClients ─────────────────────────────────────────────
+
+    /// Disconnect clients whose write_failed flag is set (protocol stream corrupted).
+    /// Safe to call after iteration since it collects IDs first.
+    fn sweepFailedClients(self: *Server) void {
+        var to_remove: [MAX_CLIENTS]u16 = undefined;
+        var count: u8 = 0;
+        var it = self.clients.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.*.write_failed) {
+                if (count < MAX_CLIENTS) {
+                    to_remove[count] = entry.key_ptr.*;
+                    count += 1;
+                }
+            }
+        }
+        for (to_remove[0..count]) |cid| {
+            self.disconnectClient(cid);
         }
     }
 

@@ -405,7 +405,7 @@ fn replaceNodeInParent(
     }
 }
 
-fn firstLeafId(node: *const LayoutNode) PaneId {
+pub fn firstLeafId(node: *const LayoutNode) PaneId {
     return switch (node.*) {
         .leaf => |l| l.id,
         .split => |s| firstLeafId(s.first),
