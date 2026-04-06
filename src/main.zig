@@ -477,7 +477,7 @@ pub fn main() !void {
         return;
     }
     if (std.mem.eql(u8, subcmd, "--version") or std.mem.eql(u8, subcmd, "-v")) {
-        std.debug.print("zplit v0.1.0\n", .{});
+        std.debug.print("zplit v0.1.1\n", .{});
         return;
     }
 
