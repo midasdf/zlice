@@ -146,10 +146,10 @@ pub const Grid = struct {
 
     // ── Character width ───────────────────────────────────────────────────────
 
-    /// Returns the display width of a Unicode codepoint (1 or 2).
+    /// Returns the display width of a Unicode codepoint (0, 1, or 2).
     fn charWidth(cp: u21) u16 {
         if (cp == 0) return 1; // NUL from VT (rare); wide spacers use a separate code path
-        return @as(u16, unicode_width.eastAsianDisplayWidth(cp));
+        return @as(u16, unicode_width.terminalDisplayWidth(cp));
     }
 
     // ── Apply VT Event ───────────────────────────────────────────────────────
@@ -159,6 +159,11 @@ pub const Grid = struct {
         switch (ev) {
             .print => |ch| {
                 const w = charWidth(ch);
+                if (w == 0) {
+                    // Combining marks / ZWJ / VS: terminal consumes without advancing column;
+                    // single-codepoint cells cannot represent overlays — skip.
+                    return null;
+                }
 
                 // Auto-wrap: if cursor + char width exceeds right margin
                 if (self.cursor_col + w > self.cols) {

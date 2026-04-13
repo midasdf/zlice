@@ -1255,7 +1255,7 @@ pub const Server = struct {
 
                 // Advance tracked column by display width so the next CUP is correct
                 // for wide characters (spacer column is skipped in the loop body).
-                const disp_w: u16 = @intCast(unicode_width.eastAsianDisplayWidth(cell.char));
+                const disp_w: u16 = @intCast(unicode_width.terminalDisplayWidth(cell.char));
                 cur_row = row;
                 cur_col = col + @max(disp_w, 1);
             }

@@ -110,8 +110,9 @@ pub fn writeString(
             i += 1;
             continue;
         };
-        const w = unicode_width.eastAsianDisplayWidth(cp);
+        const w = unicode_width.terminalDisplayWidth(cp);
         if (w == 0) {
+            // Combining / VS / ZWJ — no cell in our model; skip (same as grid .print).
             i += cp_len;
             continue;
         }

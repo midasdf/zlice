@@ -157,7 +157,7 @@ pub const Screen = struct {
                     ti += 1;
                     continue;
                 };
-                const w: u16 = @intCast(unicode_width.eastAsianDisplayWidth(cp));
+                const w: u16 = @intCast(unicode_width.terminalDisplayWidth(cp));
                 if (w == 0) {
                     ti += cp_len;
                     continue;
@@ -281,9 +281,14 @@ pub const Screen = struct {
 // ─── serializeCell ────────────────────────────────────────────────────────────
 
 /// Write a single Cell as terminal escape sequences (SGR + UTF-8 codepoint).
+/// Wide characters (EA/emoji width 2) are followed by a space so the host
+/// terminal advances two columns, matching our grid/spacer model.
 pub fn serializeCell(cell: Cell, writer: anytype) !void {
     // Skip spacer cells (second cell of wide characters)
     if (cell.char == 0) return;
+
+    const disp_w = unicode_width.terminalDisplayWidth(cell.char);
+    if (disp_w == 0) return; // combining / VS — not representable as one cell here
 
     // Build SGR: reset, then apply fg, bg, attr.
     try writer.writeAll("\x1b[0");
@@ -339,6 +344,14 @@ pub fn serializeCell(cell: Cell, writer: anytype) !void {
         return;
     };
     try writer.writeAll(buf[0..len]);
+    if (disp_w == 2) try writer.writeByte(' ');
+}
+
+test "serializeCell wide char emits trailing space" {
+    var list: std.ArrayList(u8) = .{};
+    defer list.deinit(std.testing.allocator);
+    try serializeCell(Cell{ .char = 0x3042 }, list.writer(std.testing.allocator));
+    try std.testing.expect(std.mem.endsWith(u8, list.items, " "));
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
