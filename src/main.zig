@@ -19,6 +19,42 @@ pub const client = @import("client.zig");
 pub const server = @import("server.zig");
 pub const session = @import("session.zig");
 
+// ─── CLI parsing ──────────────────────────────────────────────────────────────
+
+const ParsedCli = struct {
+    /// From `-s <name>` (last wins if repeated). Not appended to `filtered`.
+    session_name: ?[]const u8,
+    /// argv with program path stripped, `-s` and its value removed.
+    filtered: []const []const u8,
+};
+
+/// Strip the executable path, remove `-s <name>` pairs, and record the session name.
+/// Caller must `allocator.free(parsed.filtered)` when done.
+fn parseUserArgs(allocator: std.mem.Allocator, args: []const []const u8) error{ OutOfMemory, MissingSessionNameAfterS }!ParsedCli {
+    if (args.len == 0) return .{ .session_name = null, .filtered = try allocator.alloc([]const u8, 0) };
+
+    var session_name: ?[]const u8 = null;
+    var list: std.ArrayListUnmanaged([]const u8) = .{};
+    errdefer list.deinit(allocator);
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-s")) {
+            if (i + 1 >= args.len) return error.MissingSessionNameAfterS;
+            session_name = args[i + 1];
+            i += 1;
+            continue;
+        }
+        try list.append(allocator, arg);
+    }
+
+    return .{
+        .session_name = session_name,
+        .filtered = try list.toOwnedSlice(allocator),
+    };
+}
+
 // ─── Socket path helpers ──────────────────────────────────────────────────────
 
 /// Resolve `socket_dir` from config, replacing `{uid}` with the real UID.
@@ -403,27 +439,23 @@ pub fn main() !void {
     var cfg = try config.loadFromFile(allocator);
     defer cfg.deinit();
 
-    // Parse args.
+    // Parse args (handles `-s <name>` anywhere; value is not treated as a subcommand arg).
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    // Scan for -s <name> flag anywhere in args.
-    var session_name: ?[]const u8 = null;
-    var filtered_args: std.ArrayListUnmanaged([]const u8) = .{};
-    defer filtered_args.deinit(allocator);
+    const parsed = parseUserArgs(allocator, args) catch |err| switch (err) {
+        error.MissingSessionNameAfterS => {
+            std.debug.print("error: -s requires a session name\n", .{});
+            return;
+        },
+        else => |e| return e,
+    };
+    defer allocator.free(parsed.filtered);
+    const session_name = parsed.session_name;
+    const filtered_args = parsed.filtered;
 
-    for (args, 0..) |arg, i| {
-        if (std.mem.eql(u8, arg, "-s") and i + 1 < args.len) {
-            session_name = args[i + 1];
-        } else if (i > 0 and i < args.len) {
-            // Check if this arg is the value for -s (skip it).
-            if (i >= 2 and std.mem.eql(u8, args[i - 1], "-s")) continue;
-            try filtered_args.append(allocator, arg);
-        }
-    }
-
-    const has_subcmd = filtered_args.items.len > 0;
-    const subcmd = if (has_subcmd) filtered_args.items[0] else "";
+    const has_subcmd = filtered_args.len > 0;
+    const subcmd = if (has_subcmd) filtered_args[0] else "";
 
     // No subcommand: create a new session.
     if (!has_subcmd) {
@@ -437,14 +469,18 @@ pub fn main() !void {
 
     // ── Internal ──
     if (std.mem.eql(u8, subcmd, "--server")) {
-        const name = if (filtered_args.items.len > 1) filtered_args.items[1] else "0";
+        const name = if (filtered_args.len > 1) filtered_args[1] else "0";
         return runServer(allocator, &cfg, name);
     }
 
     // ── attach / a ──
     if (std.mem.eql(u8, subcmd, "attach") or std.mem.eql(u8, subcmd, "a")) {
-        if (filtered_args.items.len > 1) {
-            return attachSession(allocator, &cfg, filtered_args.items[1]);
+        const name_arg: ?[]const u8 = if (filtered_args.len > 1)
+            filtered_args[1]
+        else
+            session_name;
+        if (name_arg) |n| {
+            return attachSession(allocator, &cfg, n);
         }
         return attachAuto(allocator, &cfg);
     }
@@ -459,8 +495,12 @@ pub fn main() !void {
 
     // ── kill-session / k ──
     if (std.mem.eql(u8, subcmd, "kill-session") or std.mem.eql(u8, subcmd, "k")) {
-        if (filtered_args.items.len > 1) {
-            return killSession(allocator, &cfg, filtered_args.items[1]);
+        const name_arg: ?[]const u8 = if (filtered_args.len > 1)
+            filtered_args[1]
+        else
+            session_name;
+        if (name_arg) |n| {
+            return killSession(allocator, &cfg, n);
         }
         std.debug.print("Usage: zplit kill-session <name>\n", .{});
         return;
@@ -552,4 +592,33 @@ test "findNextSessionName returns 0 when no sockets exist" {
     defer allocator.free(name);
 
     try std.testing.expectEqualStrings("0", name);
+}
+
+test "parseUserArgs strips -s and keeps subcommand args" {
+    const allocator = std.testing.allocator;
+    const argv = [_][]const u8{ "/bin/zplit", "attach", "-s", "foo", "extra" };
+    const p = try parseUserArgs(allocator, &argv);
+    defer allocator.free(p.filtered);
+
+    try std.testing.expectEqualStrings("foo", p.session_name.?);
+    try std.testing.expectEqual(@as(usize, 2), p.filtered.len);
+    try std.testing.expectEqualStrings("attach", p.filtered[0]);
+    try std.testing.expectEqualStrings("extra", p.filtered[1]);
+}
+
+test "parseUserArgs attach -s name has positional name for attach" {
+    const allocator = std.testing.allocator;
+    const argv = [_][]const u8{ "zplit", "attach", "-s", "mysession" };
+    const p = try parseUserArgs(allocator, &argv);
+    defer allocator.free(p.filtered);
+
+    try std.testing.expectEqualStrings("mysession", p.session_name.?);
+    try std.testing.expectEqual(@as(usize, 1), p.filtered.len);
+    try std.testing.expectEqualStrings("attach", p.filtered[0]);
+}
+
+test "parseUserArgs trailing -s without value errors" {
+    const allocator = std.testing.allocator;
+    const argv = [_][]const u8{ "zplit", "list", "-s" };
+    try std.testing.expectError(error.MissingSessionNameAfterS, parseUserArgs(allocator, &argv));
 }
