@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
+const unicode_width = @import("unicode_width.zig");
 const protocol = @import("protocol.zig");
 const pty_mod = @import("pty.zig");
 const vt_mod = @import("vt.zig");
@@ -1252,12 +1253,11 @@ pub const Server = struct {
                 };
                 pos += utf8_len;
 
-                // Advance tracked cursor by 1. For wide (2-cell) chars, the next
-                // iteration handles the spacer cell (char==0) which advances by 1
-                // more, giving a total advancement of 2. This relies on
-                // composeForClient placing spacer cells correctly.
+                // Advance tracked column by display width so the next CUP is correct
+                // for wide characters (spacer column is skipped in the loop body).
+                const disp_w: u16 = @intCast(unicode_width.eastAsianDisplayWidth(cell.char));
                 cur_row = row;
-                cur_col = col + 1;
+                cur_col = col + @max(disp_w, 1);
             }
         }
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const vt = @import("vt.zig");
 const pane_mod = @import("pane.zig");
+const unicode_width = @import("unicode_width.zig");
 
 // ─── Cell ─────────────────────────────────────────────────────────────────────
 
@@ -145,17 +146,40 @@ pub const Screen = struct {
                 c += 1;
             }
 
-            // Title text (truncated to fit, leaving room for trailing space + at least one dash)
-            const max_title = if (inner_width > 3) inner_width - 3 else 0;
-            const title_len: u16 = @intCast(@min(title.len, max_title));
-            var ti: u16 = 0;
-            while (ti < title_len and c < c_right) : (ti += 1) {
-                self.cellAt(r_top, c).* = Cell{ .char = title[ti], .fg = title_fg, .attr = attr };
+            // Title text (UTF-8; display-width aware; room for trailing space + ≥1 dash)
+            const max_title_cells: u16 = if (inner_width > 3) inner_width - 3 else 0;
+            var used_cells: u16 = 0;
+            var ti: usize = 0;
+            while (ti < title.len and c < c_right and used_cells < max_title_cells) {
+                const cp_len = std.unicode.utf8ByteSequenceLength(title[ti]) catch break;
+                if (ti + cp_len > title.len) break;
+                const cp = std.unicode.utf8Decode(title[ti .. ti + cp_len]) catch {
+                    ti += 1;
+                    continue;
+                };
+                const w: u16 = @intCast(unicode_width.eastAsianDisplayWidth(cp));
+                if (w == 0) {
+                    ti += cp_len;
+                    continue;
+                }
+                if (used_cells + w > max_title_cells) break;
+                if (w == 1) {
+                    if (c >= c_right) break;
+                } else {
+                    if (c + 1 >= c_right) break;
+                }
+                self.cellAt(r_top, c).* = Cell{ .char = cp, .fg = title_fg, .attr = attr };
                 c += 1;
+                if (w == 2) {
+                    self.cellAt(r_top, c).* = Cell{ .char = 0, .fg = title_fg, .attr = attr };
+                    c += 1;
+                }
+                used_cells += w;
+                ti += cp_len;
             }
 
             // Trailing space after title (only if title was written)
-            if (title_len > 0 and c < c_right) {
+            if (used_cells > 0 and c < c_right) {
                 self.cellAt(r_top, c).* = Cell{ .char = ' ', .fg = border_fg, .attr = attr };
                 c += 1;
             }
@@ -472,4 +496,19 @@ test "drawBorderWithTitle" {
 
     // Interior untouched
     try testing.expect(Cell.eql(screen.cellAt(r_top + 1, c_left + 1).*, Cell{}));
+}
+
+test "drawBorderWithTitle UTF-8 wide char uses two cells" {
+    var screen = try Screen.init(testing.allocator, 30, 10);
+    defer screen.deinit();
+
+    const region = pane_mod.Region{ .row = 0, .col = 0, .rows = 5, .cols = 16 };
+    screen.drawBorderWithTitle(region, "漢", false);
+
+    const r_top = region.row;
+    const c_left = region.col;
+    // After leading space: one CJK char + spacer
+    try testing.expectEqual(@as(u21, ' '), screen.cellAt(r_top, c_left + 1).char);
+    try testing.expectEqual(@as(u21, 0x6F22), screen.cellAt(r_top, c_left + 2).char);
+    try testing.expectEqual(@as(u21, 0), screen.cellAt(r_top, c_left + 3).char);
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const render = @import("render.zig");
 const mode_mod = @import("mode.zig");
 const vt = @import("vt.zig");
+const unicode_width = @import("unicode_width.zig");
 
 // ─── Color constants ──────────────────────────────────────────────────────────
 
@@ -109,12 +110,25 @@ pub fn writeString(
             i += 1;
             continue;
         };
+        const w = unicode_width.eastAsianDisplayWidth(cp);
+        if (w == 0) {
+            i += cp_len;
+            continue;
+        }
         cells[offset.*] = render.Cell{
             .char = cp,
             .fg = fg,
             .bg = bg,
         };
         offset.* += 1;
+        if (w == 2 and offset.* < cells.len) {
+            cells[offset.*] = render.Cell{
+                .char = 0,
+                .fg = fg,
+                .bg = bg,
+            };
+            offset.* += 1;
+        }
         i += cp_len;
     }
 }
@@ -276,6 +290,15 @@ test "renderTabBar renders tab names" {
         .idx => |i| try testing.expectEqual(@as(u8, 8), i), // TAB_INACTIVE_BG
         else => return error.WrongInactiveTabColor,
     }
+}
+
+test "writeString wide CJK uses spacer cell" {
+    var cells: [8]render.Cell = undefined;
+    var off: u16 = 0;
+    writeString(&cells, &off, "漢", COLOR_WHITE, BAR_BG);
+    try testing.expectEqual(@as(u16, 2), off);
+    try testing.expectEqual(@as(u21, 0x6F22), cells[0].char);
+    try testing.expectEqual(@as(u21, 0), cells[1].char);
 }
 
 test "renderTabBar single tab" {
