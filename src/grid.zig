@@ -1,5 +1,6 @@
 const std = @import("std");
 const vt = @import("vt.zig");
+const unicode_width = @import("unicode_width.zig");
 const Cell = vt.Cell;
 
 // ─── Row ─────────────────────────────────────────────────────────────────────
@@ -145,37 +146,10 @@ pub const Grid = struct {
 
     // ── Character width ───────────────────────────────────────────────────────
 
-    /// Returns the display width of a Unicode codepoint (1 or 2).
-    /// CJK characters, fullwidth forms, and some symbols are 2 cells wide.
+    /// Returns the display width of a Unicode codepoint (0, 1, or 2).
     fn charWidth(cp: u21) u16 {
-        // CJK Unified Ideographs
-        if (cp >= 0x4E00 and cp <= 0x9FFF) return 2;
-        // CJK Unified Ideographs Extension A
-        if (cp >= 0x3400 and cp <= 0x4DBF) return 2;
-        // CJK Compatibility Ideographs
-        if (cp >= 0xF900 and cp <= 0xFAFF) return 2;
-        // Hiragana
-        if (cp >= 0x3040 and cp <= 0x309F) return 2;
-        // Katakana
-        if (cp >= 0x30A0 and cp <= 0x30FF) return 2;
-        // Fullwidth Forms
-        if (cp >= 0xFF01 and cp <= 0xFF60) return 2;
-        if (cp >= 0xFFE0 and cp <= 0xFFE6) return 2;
-        // Halfwidth Katakana (1-wide)
-        if (cp >= 0xFF65 and cp <= 0xFF9F) return 1;
-        // CJK Symbols and Punctuation
-        if (cp >= 0x3000 and cp <= 0x303F) return 2;
-        // Hangul Syllables
-        if (cp >= 0xAC00 and cp <= 0xD7AF) return 2;
-        // Enclosed CJK Letters
-        if (cp >= 0x3200 and cp <= 0x32FF) return 2;
-        // CJK Compatibility
-        if (cp >= 0x3300 and cp <= 0x33FF) return 2;
-        // Bopomofo
-        if (cp >= 0x3100 and cp <= 0x312F) return 2;
-        // CJK Extension B+
-        if (cp >= 0x20000 and cp <= 0x2FA1F) return 2;
-        return 1;
+        if (cp == 0) return 1; // NUL from VT (rare); wide spacers use a separate code path
+        return @as(u16, unicode_width.terminalDisplayWidth(cp));
     }
 
     // ── Apply VT Event ───────────────────────────────────────────────────────
@@ -185,6 +159,11 @@ pub const Grid = struct {
         switch (ev) {
             .print => |ch| {
                 const w = charWidth(ch);
+                if (w == 0) {
+                    // Combining marks / ZWJ / VS: terminal consumes without advancing column;
+                    // single-codepoint cells cannot represent overlays — skip.
+                    return null;
+                }
 
                 // Auto-wrap: if cursor + char width exceeds right margin
                 if (self.cursor_col + w > self.cols) {
@@ -756,8 +735,8 @@ pub const Grid = struct {
                     if (cursor_canonical_idx == current_canonical and
                         cursor_in_canonical >= offset and
                         (cursor_in_canonical <= chunk_end or
-                        // Cursor can be past trimmed content (contentLen trims trailing spaces)
-                        chunk_end == line_cells.len))
+                            // Cursor can be past trimmed content (contentLen trims trailing spaces)
+                            chunk_end == line_cells.len))
                     {
                         // Cursor at chunk_end means it's at the right edge;
                         // if it's exactly at the boundary and there's more content,
@@ -774,7 +753,6 @@ pub const Grid = struct {
             }
             current_canonical += 1;
         }
-
 
         // Phase 5: Adjust to viewport height
         while (self.rows.items.len < new_rows) {
@@ -1057,7 +1035,7 @@ test "reflow preserves content through narrow-wide cycle" {
     try std.testing.expectEqual(@as(u21, 'h'), grid.getCell(0, 0).char);
     try std.testing.expectEqual(@as(u21, 'l'), grid.getCell(0, 9).char);
 
-    // Resize back to wide (20 cols) — should restore "hello world"  
+    // Resize back to wide (20 cols) — should restore "hello world"
     try grid.resize(20, 5);
     try std.testing.expectEqual(@as(u21, 'h'), grid.getCell(0, 0).char);
     try std.testing.expectEqual(@as(u21, 'd'), grid.getCell(0, 10).char);

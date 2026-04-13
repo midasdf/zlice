@@ -18,6 +18,7 @@ pub const status_bar = @import("status_bar.zig");
 pub const client = @import("client.zig");
 pub const server = @import("server.zig");
 pub const session = @import("session.zig");
+pub const unicode_width = @import("unicode_width.zig");
 
 // ─── CLI parsing ──────────────────────────────────────────────────────────────
 
@@ -544,6 +545,7 @@ test {
     _ = client;
     _ = server;
     _ = session;
+    _ = unicode_width;
 }
 
 test "getSocketDir replaces {uid}" {
