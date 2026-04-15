@@ -14,10 +14,12 @@ pub const Pty = struct {
     pid: posix.pid_t,
 
     /// Spawn a new PTY with the given shell and terminal dimensions.
-    pub fn spawn(shell: [:0]const u8, cols: u16, rows: u16) !Pty {
+    pub fn spawn(shell: [:0]const u8, cols: u16, rows: u16, environ: std.process.Environ) !Pty {
         // Open /dev/ptmx (PTY master multiplexer)
-        const master_fd = try posix.openZ("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true }, 0);
-        errdefer posix.close(master_fd);
+        const ptmx_rc = linux.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true }, 0);
+        if (linux.errno(ptmx_rc) != .SUCCESS) return error.OpenPtmxFailed;
+        const master_fd: posix.fd_t = @intCast(ptmx_rc);
+        errdefer _ = linux.close(master_fd);
 
         // Unlock the PTY slave (TIOCSPTLCK = 0)
         var lock: c_int = 0;
@@ -46,16 +48,18 @@ pub const Pty = struct {
             return error.IoctlFailed;
         }
 
-        const pid = try posix.fork();
+        const fork_rc = linux.fork();
+        if (linux.errno(fork_rc) != .SUCCESS) return error.ForkFailed;
+        const pid: posix.pid_t = @intCast(fork_rc);
 
         if (pid == 0) {
             // ---- Child process ----
-            posix.close(master_fd);
+            _ = linux.close(master_fd);
 
             // Create a new session so we can have a controlling terminal
             const sid_result = linux.setsid();
             const sid_err = if (@TypeOf(sid_result) == usize)
-                linux.E.init(sid_result)
+                linux.errno(sid_result)
             else if (sid_result == -1)
                 linux.E.PERM // any non-SUCCESS value
             else
@@ -63,33 +67,35 @@ pub const Pty = struct {
             if (sid_err != .SUCCESS) std.process.exit(1);
 
             // Open slave PTY as controlling terminal
-            const slave_fd = posix.openZ(slave_path.ptr, .{ .ACCMODE = .RDWR }, 0) catch {
+            const slave_rc = linux.open(slave_path.ptr, .{ .ACCMODE = .RDWR }, 0);
+            if (linux.errno(slave_rc) != .SUCCESS) {
                 std.process.exit(1);
-            };
+            }
+            const slave_fd: posix.fd_t = @intCast(slave_rc);
 
             // TIOCSCTTY: make this the controlling terminal (arg 0 = don't steal)
             _ = linux.ioctl(slave_fd, TIOCSCTTY, 0);
 
             // Redirect stdin/stdout/stderr to slave PTY
-            posix.dup2(slave_fd, posix.STDIN_FILENO) catch std.process.exit(1);
-            posix.dup2(slave_fd, posix.STDOUT_FILENO) catch std.process.exit(1);
-            posix.dup2(slave_fd, posix.STDERR_FILENO) catch std.process.exit(1);
+            if (linux.errno(linux.dup2(slave_fd, posix.STDIN_FILENO)) != .SUCCESS) std.process.exit(1);
+            if (linux.errno(linux.dup2(slave_fd, posix.STDOUT_FILENO)) != .SUCCESS) std.process.exit(1);
+            if (linux.errno(linux.dup2(slave_fd, posix.STDERR_FILENO)) != .SUCCESS) std.process.exit(1);
 
             // Close the slave fd if it's not one of the standard fds
-            if (slave_fd > 2) posix.close(slave_fd);
+            if (slave_fd > 2) _ = linux.close(slave_fd);
 
             // Build argv for execve
             const argv: [*:null]const ?[*:0]const u8 = &[_:null]?[*:0]const u8{shell};
 
             // Build envp with essential variables from parent + TERM override
-            const home = posix.getenv("HOME") orelse "/";
-            const user = posix.getenv("USER") orelse "user";
-            const path = posix.getenv("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
-            const lang = posix.getenv("LANG") orelse "C.UTF-8";
-            const shell_env = posix.getenv("SHELL") orelse "/bin/sh";
+            const home = std.process.Environ.getPosix(environ, "HOME") orelse "/";
+            const user = std.process.Environ.getPosix(environ, "USER") orelse "user";
+            const path = std.process.Environ.getPosix(environ, "PATH") orelse "/usr/local/bin:/usr/bin:/bin";
+            const lang = std.process.Environ.getPosix(environ, "LANG") orelse "C.UTF-8";
+            const shell_env = std.process.Environ.getPosix(environ, "SHELL") orelse "/bin/sh";
 
             // Inherit TERM from parent (e.g. st-256color) instead of forcing xterm-256color
-            const term_val = posix.getenv("TERM") orelse "xterm-256color";
+            const term_val = std.process.Environ.getPosix(environ, "TERM") orelse "xterm-256color";
             var term_buf: [64]u8 = undefined;
             const term_str = std.fmt.bufPrintZ(&term_buf, "TERM={s}", .{term_val}) catch "TERM=xterm-256color";
             var home_buf: [256]u8 = undefined;
@@ -104,14 +110,14 @@ pub const Pty = struct {
             const shell_str = std.fmt.bufPrintZ(&shell_buf, "SHELL={s}", .{shell_env}) catch "SHELL=/bin/sh";
 
             // Optional env vars from parent
-            const display = posix.getenv("DISPLAY");
+            const display = std.process.Environ.getPosix(environ, "DISPLAY");
             var display_buf: [128]u8 = undefined;
             const display_str: ?[:0]const u8 = if (display) |d|
                 (std.fmt.bufPrintZ(&display_buf, "DISPLAY={s}", .{d}) catch null)
             else
                 null;
 
-            const xdg_rt = posix.getenv("XDG_RUNTIME_DIR");
+            const xdg_rt = std.process.Environ.getPosix(environ, "XDG_RUNTIME_DIR");
             var xdg_buf: [256]u8 = undefined;
             const xdg_str: ?[:0]const u8 = if (xdg_rt) |x|
                 (std.fmt.bufPrintZ(&xdg_buf, "XDG_RUNTIME_DIR={s}", .{x}) catch null)
@@ -137,7 +143,7 @@ pub const Pty = struct {
 
             const envp: [*:null]const ?[*:0]const u8 = @ptrCast(&env_entries);
 
-            posix.execveZ(shell, argv, envp) catch {};
+            _ = linux.execve(shell, argv, envp);
             std.process.exit(1);
         }
 
@@ -163,7 +169,7 @@ pub const Pty = struct {
 
     /// Close the PTY and send SIGHUP to the child process.
     pub fn close(self: *Pty) void {
-        posix.close(self.master_fd);
+        _ = linux.close(self.master_fd);
         posix.kill(self.pid, posix.SIG.HUP) catch {};
     }
 
@@ -178,7 +184,9 @@ pub const Pty = struct {
 
     /// Write data to the PTY master. Returns the number of bytes written.
     pub fn write(self: *Pty, data: []const u8) !usize {
-        return posix.write(self.master_fd, data);
+        const w_rc = linux.write(self.master_fd, data.ptr, data.len);
+        if (linux.errno(w_rc) != .SUCCESS) return error.WriteFailed;
+        return w_rc;
     }
 };
 
