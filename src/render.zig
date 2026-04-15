@@ -205,7 +205,7 @@ pub const Screen = struct {
     /// Returns a slice of DirtyRegion for each contiguous run of changed cells.
     /// Caller owns the returned slice AND each region's cells slice.
     pub fn getDirtyRegions(self: *Screen, allocator: std.mem.Allocator) ![]DirtyRegion {
-        var regions: std.ArrayList(DirtyRegion) = .{};
+        var regions: std.ArrayList(DirtyRegion) = .empty;
         errdefer {
             for (regions.items) |dr| allocator.free(dr.cells);
             regions.deinit(allocator);
