@@ -342,11 +342,9 @@ test "load nonexistent returns null" {
 }
 
 test "delete removes file" {
-    const allocator = testing.allocator;
     const io = std.testing.io;
 
     const file_path = "/tmp/zplit-del-test.json";
-    defer allocator.free(@as([]u8, @constCast(file_path[0..0]))); // no-op, just for symmetry
 
     // Create a dummy file.
     const f = try std.Io.Dir.createFileAbsolute(io, file_path, .{});

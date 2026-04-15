@@ -1230,6 +1230,9 @@ pub const Server = struct {
             const w_rc = linux.write(cs.fd, buf[sent..n].ptr, n - sent);
             const w_err = linux.errno(w_rc);
             if (w_err != .SUCCESS) {
+                // Retry on signal interruption — matches the old posix.write behavior
+                // that std.posix.* used to do automatically.
+                if (w_err == .INTR) continue;
                 // WouldBlock before any data sent = transient backpressure, skip frame
                 // WouldBlock after partial send = protocol stream corrupted, must disconnect
                 if ((w_err == .AGAIN) and sent == 0) return error.WouldBlock;

@@ -184,9 +184,14 @@ pub const Pty = struct {
 
     /// Write data to the PTY master. Returns the number of bytes written.
     pub fn write(self: *Pty, data: []const u8) !usize {
-        const w_rc = linux.write(self.master_fd, data.ptr, data.len);
-        if (linux.errno(w_rc) != .SUCCESS) return error.WriteFailed;
-        return w_rc;
+        while (true) {
+            const w_rc = linux.write(self.master_fd, data.ptr, data.len);
+            switch (linux.errno(w_rc)) {
+                .SUCCESS => return w_rc,
+                .INTR => continue,
+                else => return error.WriteFailed,
+            }
+        }
     }
 };
 
