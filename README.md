@@ -38,7 +38,7 @@ Measured on Raspberry Pi Zero 2W (aarch64, Arch Linux ARM), March 2026:
 ### Build from source
 
 ```bash
-# Requires Zig 0.15+
+# Requires Zig 0.16+
 git clone https://github.com/midasdf/zplit.git
 cd zplit
 zig build -Doptimize=ReleaseSmall
