@@ -59,28 +59,28 @@ fn getSocketPath(allocator: std.mem.Allocator, cfg: *const config.Config, name: 
 /// Returns false if connection failed (stale socket).
 fn isSessionAlive(socket_path: [:0]const u8) bool {
     const fd = client.connect(socket_path) catch return false;
-    posix.close(fd);
+    _ = linux.close(fd);
     return true;
 }
 
 /// Find the lowest unused numeric session name (0, 1, 2, ...).
 /// Stale sockets (dead server) are cleaned up and their names reused.
 /// Caller owns the returned string.
-fn findNextSessionName(allocator: std.mem.Allocator, cfg: *const config.Config) ![]const u8 {
+fn findNextSessionName(allocator: std.mem.Allocator, io: std.Io, cfg: *const config.Config) ![]const u8 {
     var num: u32 = 0;
     while (num < 1000) : (num += 1) {
         const name = try std.fmt.allocPrint(allocator, "{d}", .{num});
         const socket_path = try getSocketPath(allocator, cfg, name);
         defer allocator.free(socket_path);
 
-        if (std.fs.accessAbsolute(socket_path, .{})) {
+        if (std.Io.Dir.accessAbsolute(io, socket_path, .{})) {
             // Socket exists — check if server is alive.
             if (isSessionAlive(socket_path)) {
                 // Session alive, try next number.
                 allocator.free(name);
             } else {
                 // Stale socket — clean up and reuse this name.
-                posix.unlink(socket_path) catch {};
+                _ = linux.unlink(socket_path);
                 return name;
             }
         } else |_| {
@@ -96,20 +96,20 @@ fn findNextSessionName(allocator: std.mem.Allocator, cfg: *const config.Config) 
 /// Returns the name of the first (lowest-numbered) live session.
 /// Cleans up stale sockets encountered during scan.
 /// Caller owns the returned string.
-fn findFirstSession(allocator: std.mem.Allocator, cfg: *const config.Config) ![]const u8 {
+fn findFirstSession(allocator: std.mem.Allocator, io: std.Io, cfg: *const config.Config) ![]const u8 {
     const dir_path = try getSocketDir(allocator, cfg);
     defer allocator.free(dir_path);
 
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch {
         return error.NoActiveSessions;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var best: ?[]const u8 = null;
     var best_num: ?u32 = null;
 
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .file and entry.kind != .unix_domain_socket) continue;
         if (!std.mem.endsWith(u8, entry.name, ".sock")) continue;
         const name = entry.name[0 .. entry.name.len - ".sock".len];
@@ -119,7 +119,7 @@ fn findFirstSession(allocator: std.mem.Allocator, cfg: *const config.Config) ![]
         defer allocator.free(socket_path);
 
         if (!isSessionAlive(socket_path)) {
-            posix.unlink(socket_path) catch {};
+            _ = linux.unlink(socket_path);
             continue;
         }
 
@@ -143,20 +143,20 @@ fn findFirstSession(allocator: std.mem.Allocator, cfg: *const config.Config) ![]
 
 /// Count live sessions. Returns count and a list of names.
 /// Caller owns the returned names slice and each string within.
-fn countSessions(allocator: std.mem.Allocator, cfg: *const config.Config) !struct { count: u32, names: [][]const u8 } {
+fn countSessions(allocator: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !struct { count: u32, names: [][]const u8 } {
     const dir_path = try getSocketDir(allocator, cfg);
     defer allocator.free(dir_path);
 
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch {
         const empty = try allocator.alloc([]const u8, 0);
         return .{ .count = 0, .names = empty };
     };
-    defer dir.close();
+    defer dir.close(io);
 
-    var names: std.ArrayListUnmanaged([]const u8) = .{};
+    var names: std.ArrayListUnmanaged([]const u8) = .{ .items = &.{}, .capacity = 0 };
 
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .file and entry.kind != .unix_domain_socket) continue;
         if (!std.mem.endsWith(u8, entry.name, ".sock")) continue;
         const name = entry.name[0 .. entry.name.len - ".sock".len];
@@ -167,7 +167,7 @@ fn countSessions(allocator: std.mem.Allocator, cfg: *const config.Config) !struc
         if (isSessionAlive(socket_path)) {
             try names.append(allocator, try allocator.dupe(u8, name));
         } else {
-            posix.unlink(socket_path) catch {};
+            _ = linux.unlink(socket_path);
         }
     }
 
@@ -178,40 +178,40 @@ fn countSessions(allocator: std.mem.Allocator, cfg: *const config.Config) !struc
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 /// Internal: run as the server process (foreground — caller forked us).
-fn runServer(allocator: std.mem.Allocator, cfg: *const config.Config, name: []const u8) !void {
+fn runServer(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ, cfg: *const config.Config, name: []const u8) !void {
     const socket_path = try getSocketPath(allocator, cfg, name);
     defer allocator.free(socket_path);
 
-    var srv = try server.Server.init(allocator, socket_path, name, cfg.*);
+    var srv = try server.Server.init(allocator, io, environ, socket_path, name, cfg.*);
     defer srv.deinit();
 
     try srv.run();
 }
 
 /// Attach to an existing session by name.
-fn attachSession(allocator: std.mem.Allocator, cfg: *const config.Config, name: []const u8) !void {
+fn attachSession(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ, cfg: *const config.Config, name: []const u8) !void {
     const socket_path = try getSocketPath(allocator, cfg, name);
     defer allocator.free(socket_path);
 
     // Verify socket exists before trying to connect.
-    std.fs.accessAbsolute(socket_path, .{}) catch {
+    std.Io.Dir.accessAbsolute(io, socket_path, .{}) catch {
         std.debug.print("No session named '{s}' found.\n", .{name});
         return error.SessionNotFound;
     };
 
     // Verify server is alive (clean up stale socket if not).
     if (!isSessionAlive(socket_path)) {
-        posix.unlink(socket_path) catch {};
+        _ = linux.unlink(socket_path);
         std.debug.print("Session '{s}' is dead (stale socket removed).\n", .{name});
         return error.SessionNotFound;
     }
 
-    try client.run(socket_path);
+    try client.run(socket_path, io, environ);
 }
 
 /// Attach without a name: auto-select if only one session, prompt if multiple.
-fn attachAuto(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
-    const result = try countSessions(allocator, cfg);
+fn attachAuto(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ, cfg: *const config.Config) !void {
+    const result = try countSessions(allocator, io, cfg);
     defer {
         for (result.names) |n| allocator.free(n);
         allocator.free(result.names);
@@ -223,7 +223,7 @@ fn attachAuto(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
         },
         1 => {
             // Single session — attach directly.
-            try attachSession(allocator, cfg, result.names[0]);
+            try attachSession(allocator, io, environ, cfg, result.names[0]);
         },
         else => {
             // Multiple sessions — list them and ask user to specify.
@@ -238,22 +238,22 @@ fn attachAuto(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
 
 /// Create a new session. Errors if the session name is already in use.
 /// Stale sockets are cleaned up transparently.
-fn startNewSession(allocator: std.mem.Allocator, cfg: *const config.Config, name: []const u8) !void {
+fn startNewSession(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ, cfg: *const config.Config, name: []const u8) !void {
     const socket_path = try getSocketPath(allocator, cfg, name);
     defer allocator.free(socket_path);
 
     // If socket exists, check liveness.
-    if (std.fs.accessAbsolute(socket_path, .{})) {
+    if (std.Io.Dir.accessAbsolute(io, socket_path, .{})) {
         if (isSessionAlive(socket_path)) {
             std.debug.print("Session '{s}' already exists. Use 'zplit attach {s}' to connect.\n", .{ name, name });
             return;
         }
         // Stale socket — clean up and proceed with creating a new session.
-        posix.unlink(socket_path) catch {};
+        _ = linux.unlink(socket_path);
     } else |_| {}
 
     // Fork + exec self with `--server <name>`.
-    const self_exe = try std.fs.selfExePathAlloc(allocator);
+    const self_exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(self_exe);
 
     const self_exe_z = try allocator.dupeZ(u8, self_exe);
@@ -263,23 +263,25 @@ fn startNewSession(allocator: std.mem.Allocator, cfg: *const config.Config, name
     defer allocator.free(name_z);
 
     // Build a null-terminated envp from the current environment (no libc).
-    // std.os.environ is [][*:0]u8; we need [*:null]const ?[*:0]const u8.
-    const env_slice = std.os.environ;
-    const envp_buf = try allocator.alloc(?[*:0]const u8, env_slice.len + 1);
+    // environ.block.view().slice is []const [*:0]const u8.
+    const env_view = environ.block.view();
+    const envp_buf = try allocator.alloc(?[*:0]const u8, env_view.slice.len + 1);
     defer allocator.free(envp_buf);
-    for (env_slice, 0..) |ptr, i| {
-        envp_buf[i] = @ptrCast(ptr);
+    for (env_view.slice, 0..) |ptr, i| {
+        envp_buf[i] = ptr;
     }
-    envp_buf[env_slice.len] = null;
+    envp_buf[env_view.slice.len] = null;
     const envp: [*:null]const ?[*:0]const u8 = @ptrCast(envp_buf.ptr);
 
-    const pid = try posix.fork();
+    const fork_rc = linux.fork();
+    if (linux.errno(fork_rc) != .SUCCESS) return error.ForkFailed;
+    const pid: posix.pid_t = @intCast(fork_rc);
     if (pid == 0) {
         // Child: exec self as server.
         // Detach from the parent's session/process group so it survives.
         const sid_result = linux.setsid();
         const sid_err = if (@TypeOf(sid_result) == usize)
-            linux.E.init(sid_result)
+            linux.errno(sid_result)
         else if (sid_result == -1)
             linux.E.PERM
         else
@@ -292,27 +294,28 @@ fn startNewSession(allocator: std.mem.Allocator, cfg: *const config.Config, name
             name_z.ptr,
             null,
         };
-        const err = posix.execveZ(self_exe_z, &argv, envp);
+        _ = linux.execve(self_exe_z, &argv, envp);
         // If execve returns, something went wrong.
-        std.debug.print("execve failed: {s}\n", .{@errorName(err)});
-        posix.exit(1);
+        std.debug.print("execve failed\n", .{});
+        linux.exit(1);
     }
 
     // Parent: poll for the socket file, up to ~1 second (100 × 10 ms).
     var attempts: u32 = 0;
     while (attempts < 100) : (attempts += 1) {
-        std.Thread.sleep(10 * std.time.ns_per_ms);
-        if (std.fs.accessAbsolute(socket_path, .{})) {
+        const ts = linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&ts, null);
+        if (std.Io.Dir.accessAbsolute(io, socket_path, .{})) {
             break;
         } else |_| {}
     }
 
-    try client.run(socket_path);
+    try client.run(socket_path, io, environ);
 }
 
 /// List all active sessions by scanning the socket directory for .sock files.
-fn listSessions(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
-    const result = try countSessions(allocator, cfg);
+fn listSessions(allocator: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !void {
+    const result = try countSessions(allocator, io, cfg);
     defer {
         for (result.names) |n| allocator.free(n);
         allocator.free(result.names);
@@ -330,17 +333,17 @@ fn listSessions(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
 
 /// Kill a session by name. Connects and immediately disconnects, relying on
 /// server cleanup. If the server is already dead, removes the stale socket.
-fn killSession(allocator: std.mem.Allocator, cfg: *const config.Config, name: []const u8) !void {
+fn killSession(allocator: std.mem.Allocator, io: std.Io, cfg: *const config.Config, name: []const u8) !void {
     const socket_path = try getSocketPath(allocator, cfg, name);
     defer allocator.free(socket_path);
 
-    std.fs.accessAbsolute(socket_path, .{}) catch {
+    std.Io.Dir.accessAbsolute(io, socket_path, .{}) catch {
         std.debug.print("No session named '{s}' found.\n", .{name});
         return;
     };
 
     if (!isSessionAlive(socket_path)) {
-        posix.unlink(socket_path) catch {};
+        _ = linux.unlink(socket_path);
         std.debug.print("Removed stale session '{s}'.\n", .{name});
         return;
     }
@@ -348,13 +351,13 @@ fn killSession(allocator: std.mem.Allocator, cfg: *const config.Config, name: []
     // Send a kill signal: connect, send a quit command, disconnect.
     // For now, just unlink the socket — the server will notice on next epoll
     // and shut down when it can no longer accept new connections.
-    posix.unlink(socket_path) catch {};
+    _ = linux.unlink(socket_path);
     std.debug.print("Killed session '{s}'.\n", .{name});
 }
 
 /// Kill all sessions.
-fn killAllSessions(allocator: std.mem.Allocator, cfg: *const config.Config) !void {
-    const result = try countSessions(allocator, cfg);
+fn killAllSessions(allocator: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !void {
+    const result = try countSessions(allocator, io, cfg);
     defer {
         for (result.names) |n| allocator.free(n);
         allocator.free(result.names);
@@ -366,7 +369,7 @@ fn killAllSessions(allocator: std.mem.Allocator, cfg: *const config.Config) !voi
     }
 
     for (result.names) |name| {
-        try killSession(allocator, cfg, name);
+        try killSession(allocator, io, cfg, name);
     }
 }
 
@@ -394,22 +397,21 @@ fn printUsage() void {
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const environ = init.minimal.environ;
 
     // Load config (falls back to defaults if the file doesn't exist).
-    var cfg = try config.loadFromFile(allocator);
+    var cfg = try config.loadFromFile(allocator, io, environ);
     defer cfg.deinit();
 
-    // Parse args.
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    // Parse args — toSlice gives us a []const [:0]const u8 backed by the arena.
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     // Scan for -s <name> flag anywhere in args.
     var session_name: ?[]const u8 = null;
-    var filtered_args: std.ArrayListUnmanaged([]const u8) = .{};
+    var filtered_args: std.ArrayListUnmanaged([]const u8) = .{ .items = &.{}, .capacity = 0 };
     defer filtered_args.deinit(allocator);
 
     for (args, 0..) |arg, i| {
@@ -430,23 +432,23 @@ pub fn main() !void {
         const name = if (session_name) |s|
             try allocator.dupe(u8, s)
         else
-            try findNextSessionName(allocator, &cfg);
+            try findNextSessionName(allocator, io, &cfg);
         defer allocator.free(name);
-        return startNewSession(allocator, &cfg, name);
+        return startNewSession(allocator, io, environ, &cfg, name);
     }
 
     // ── Internal ──
     if (std.mem.eql(u8, subcmd, "--server")) {
         const name = if (filtered_args.items.len > 1) filtered_args.items[1] else "0";
-        return runServer(allocator, &cfg, name);
+        return runServer(allocator, io, environ, &cfg, name);
     }
 
     // ── attach / a ──
     if (std.mem.eql(u8, subcmd, "attach") or std.mem.eql(u8, subcmd, "a")) {
         if (filtered_args.items.len > 1) {
-            return attachSession(allocator, &cfg, filtered_args.items[1]);
+            return attachSession(allocator, io, environ, &cfg, filtered_args.items[1]);
         }
-        return attachAuto(allocator, &cfg);
+        return attachAuto(allocator, io, environ, &cfg);
     }
 
     // ── list-sessions / ls / list (backward compat) ──
@@ -454,13 +456,13 @@ pub fn main() !void {
         std.mem.eql(u8, subcmd, "ls") or
         std.mem.eql(u8, subcmd, "list"))
     {
-        return listSessions(allocator, &cfg);
+        return listSessions(allocator, io, &cfg);
     }
 
     // ── kill-session / k ──
     if (std.mem.eql(u8, subcmd, "kill-session") or std.mem.eql(u8, subcmd, "k")) {
         if (filtered_args.items.len > 1) {
-            return killSession(allocator, &cfg, filtered_args.items[1]);
+            return killSession(allocator, io, &cfg, filtered_args.items[1]);
         }
         std.debug.print("Usage: zplit kill-session <name>\n", .{});
         return;
@@ -468,7 +470,7 @@ pub fn main() !void {
 
     // ── kill-all-sessions / ka ──
     if (std.mem.eql(u8, subcmd, "kill-all-sessions") or std.mem.eql(u8, subcmd, "ka")) {
-        return killAllSessions(allocator, &cfg);
+        return killAllSessions(allocator, io, &cfg);
     }
 
     // ── help / version ──
@@ -548,7 +550,7 @@ test "findNextSessionName returns 0 when no sockets exist" {
     var cfg = config.Config{
         .socket_dir = "/tmp/zplit-test-nonexistent-999999",
     };
-    const name = try findNextSessionName(allocator, &cfg);
+    const name = try findNextSessionName(allocator, std.testing.io, &cfg);
     defer allocator.free(name);
 
     try std.testing.expectEqualStrings("0", name);
