@@ -168,6 +168,8 @@ pub const ClientState = struct {
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
     config: config_mod.Config,
     tab_manager: tab_mod.TabManager,
     pane_states: std.AutoHashMap(pane_mod.PaneId, *PaneState),
@@ -199,13 +201,15 @@ pub const Server = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
+        environ: std.process.Environ,
         socket_path: [:0]const u8,
         session_name: []const u8,
         config: config_mod.Config,
     ) !Server {
         // Ensure parent directory exists with mode 0o700
         if (std.fs.path.dirname(socket_path)) |dir_path| {
-            std.fs.makeDirAbsolute(dir_path) catch |err| {
+            std.Io.Dir.createDirAbsolute(io, dir_path, .default_dir) catch |err| {
                 if (err != error.PathAlreadyExists) return err;
             };
             // chmod the directory to 0700
@@ -215,23 +219,25 @@ pub const Server = struct {
         }
 
         // Remove stale socket file if present
-        posix.unlink(socket_path) catch {};
+        _ = linux.unlink(socket_path);
 
         // Create + bind listen socket
-        const listen_fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-        errdefer posix.close(listen_fd);
+        const sock_rc = linux.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+        if (linux.errno(sock_rc) != .SUCCESS) return error.SocketFailed;
+        const listen_fd: posix.fd_t = @intCast(sock_rc);
+        errdefer _ = linux.close(listen_fd);
 
         var addr = posix.sockaddr.un{ .path = [_]u8{0} ** 108 };
         if (socket_path.len >= addr.path.len) return error.NameTooLong;
         @memcpy(addr.path[0..socket_path.len], socket_path);
-        try posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
-        try posix.listen(listen_fd, 1);
+        if (linux.errno(linux.bind(listen_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un))) != .SUCCESS) return error.BindFailed;
+        if (linux.errno(linux.listen(listen_fd, 1)) != .SUCCESS) return error.ListenFailed;
 
         // Create epoll instance
         const epoll_fd_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
-        if (linux.E.init(epoll_fd_rc) != .SUCCESS) return error.EpollCreateFailed;
+        if (linux.errno(epoll_fd_rc) != .SUCCESS) return error.EpollCreateFailed;
         const epoll_fd: posix.fd_t = @intCast(epoll_fd_rc);
-        errdefer posix.close(epoll_fd);
+        errdefer _ = linux.close(epoll_fd);
 
         // Register listen_fd on epoll
         {
@@ -240,7 +246,7 @@ pub const Server = struct {
                 .data = .{ .u64 = TAG_LISTEN },
             };
             const r = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, listen_fd, &ev);
-            if (linux.E.init(r) != .SUCCESS) return error.EpollCtlFailed;
+            if (linux.errno(r) != .SUCCESS) return error.EpollCtlFailed;
         }
 
         // Initialize TabManager (creates first tab with one pane, id=0)
@@ -255,6 +261,8 @@ pub const Server = struct {
 
         var srv = Server{
             .allocator = allocator,
+            .io = io,
+            .environ = environ,
             .config = config,
             .tab_manager = tab_manager,
             .pane_states = std.AutoHashMap(pane_mod.PaneId, *PaneState).init(allocator),
@@ -291,18 +299,18 @@ pub const Server = struct {
         var cl_it = self.clients.valueIterator();
         while (cl_it.next()) |cs_ptr| {
             const cs = cs_ptr.*;
-            posix.close(cs.fd);
+            _ = linux.close(cs.fd);
             cs.deinit();
         }
         self.clients.deinit();
 
-        posix.close(self.listen_fd);
-        posix.close(self.epoll_fd);
+        _ = linux.close(self.listen_fd);
+        _ = linux.close(self.epoll_fd);
 
         // Remove socket file
         const socket_pathZ = self.allocator.dupeZ(u8, self.socket_path) catch null;
         if (socket_pathZ) |p| {
-            posix.unlink(p) catch {};
+            _ = linux.unlink(p);
             self.allocator.free(p);
         }
         self.allocator.free(self.socket_path);
@@ -321,9 +329,9 @@ pub const Server = struct {
         _ = linux.sigprocmask(linux.SIG.BLOCK, &sig_mask, null);
 
         const sig_fd_rc = linux.signalfd(-1, &sig_mask, linux.SFD.CLOEXEC);
-        if (linux.E.init(sig_fd_rc) != .SUCCESS) return error.SignalFdFailed;
+        if (linux.errno(sig_fd_rc) != .SUCCESS) return error.SignalFdFailed;
         const sig_fd: posix.fd_t = @intCast(sig_fd_rc);
-        defer posix.close(sig_fd);
+        defer _ = linux.close(sig_fd);
 
         {
             var ev = linux.epoll_event{
@@ -331,13 +339,13 @@ pub const Server = struct {
                 .data = .{ .u64 = TAG_SIGNAL },
             };
             const r = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, sig_fd, &ev);
-            if (linux.E.init(r) != .SUCCESS) return error.EpollCtlFailed;
+            if (linux.errno(r) != .SUCCESS) return error.EpollCtlFailed;
         }
 
         while (self.running) {
             var events: [32]linux.epoll_event = undefined;
             const n_rc = linux.epoll_wait(self.epoll_fd, &events, events.len, -1);
-            const n_events = switch (linux.E.init(n_rc)) {
+            const n_events = switch (linux.errno(n_rc)) {
                 .SUCCESS => n_rc,
                 .INTR => continue,
                 else => return error.EpollWaitFailed,
@@ -348,9 +356,11 @@ pub const Server = struct {
 
                 if (tag == TAG_LISTEN) {
                     // Accept a new client connection
-                    const new_fd = posix.accept(self.listen_fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK) catch continue;
+                    const acc_rc = linux.accept4(self.listen_fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
+                    if (linux.errno(acc_rc) != .SUCCESS) continue;
+                    const new_fd: posix.fd_t = @intCast(acc_rc);
                     if (self.clients.count() >= MAX_CLIENTS) {
-                        posix.close(new_fd);
+                        _ = linux.close(new_fd);
                         continue;
                     }
                     // Assign ID (skip if in use)
@@ -359,12 +369,12 @@ pub const Server = struct {
                     self.next_client_id = id +% 1;
 
                     const cs = ClientState.init(self.allocator, id, new_fd) catch {
-                        posix.close(new_fd);
+                        _ = linux.close(new_fd);
                         continue;
                     };
                     self.clients.put(id, cs) catch {
                         cs.deinit();
-                        posix.close(new_fd);
+                        _ = linux.close(new_fd);
                         continue;
                     };
                     var client_ev = linux.epoll_event{
@@ -372,7 +382,7 @@ pub const Server = struct {
                         .data = .{ .u64 = clientTag(id) },
                     };
                     const r2 = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, new_fd, &client_ev);
-                    if (linux.E.init(r2) != .SUCCESS) {
+                    if (linux.errno(r2) != .SUCCESS) {
                         _ = self.clients.remove(id);
                         cs.deinit();
                         continue;
@@ -420,7 +430,7 @@ pub const Server = struct {
                     // SIGTERM or SIGINT — save layout before exit
                     var ssi: linux.signalfd_siginfo = undefined;
                     _ = posix.read(sig_fd, std.mem.asBytes(&ssi)) catch {};
-                    session_mod.saveSession(self.allocator, self.session_name, &self.tab_manager) catch {};
+                    session_mod.saveSession(self.allocator, self.io, self.environ, self.session_name, &self.tab_manager) catch {};
                     self.running = false;
 
                 } else if (isPtyTag(tag)) {
@@ -476,7 +486,7 @@ pub const Server = struct {
             .command => {
                 if (payload.len < 1) return;
                 self.active_client = client_id;
-                const cmd = std.meta.intToEnum(protocol.CommandId, payload[0]) catch return;
+                const cmd = std.enums.fromInt(protocol.CommandId, payload[0]) orelse return;
                 self.handleCommand(client_id, cmd, payload[1..]);
             },
             .resize => {
@@ -489,7 +499,7 @@ pub const Server = struct {
             },
             .state => {
                 if (payload.len >= 1) {
-                    const new_mode = std.meta.intToEnum(mode_mod.Mode, payload[0]) catch .normal;
+                    const new_mode = std.enums.fromInt(mode_mod.Mode, payload[0]) orelse .normal;
                     if (cs.mode == .scroll and new_mode != .scroll) {
                         // Reset scroll offset on leaving scroll mode
                         const active_pane = cs.active_panes[cs.active_tab];
@@ -543,7 +553,7 @@ pub const Server = struct {
             },
             .focus_pane => {
                 if (payload.len < 1) return;
-                const dir = std.meta.intToEnum(protocol.Direction, payload[0]) catch return;
+                const dir = std.enums.fromInt(protocol.Direction, payload[0]) orelse return;
                 const status_bar_rows: u16 = if (self.config.status_bar and cs.rows > 0) 1 else 0;
                 const tab_bar_rows: u16 = if (cs.rows > 0) 1 else 0;
                 const reserved = tab_bar_rows + status_bar_rows;
@@ -558,7 +568,7 @@ pub const Server = struct {
             },
             .resize_pane => {
                 if (payload.len < 3) return;
-                const dir = std.meta.intToEnum(protocol.Direction, payload[0]) catch return;
+                const dir = std.enums.fromInt(protocol.Direction, payload[0]) orelse return;
                 const delta: i16 = @bitCast((@as(u16, payload[1]) << 8) | payload[2]);
                 active_tab.pane_tree.resizePane(active_pane_id, dir, delta);
                 self.invalidateAllClients();
@@ -650,11 +660,11 @@ pub const Server = struct {
                 }
             },
             .detach => {
-                session_mod.saveSession(self.allocator, self.session_name, &self.tab_manager) catch {};
+                session_mod.saveSession(self.allocator, self.io, self.environ, self.session_name, &self.tab_manager) catch {};
                 self.disconnectClient(client_id);
             },
             .quit => {
-                session_mod.saveSession(self.allocator, self.session_name, &self.tab_manager) catch {};
+                session_mod.saveSession(self.allocator, self.io, self.environ, self.session_name, &self.tab_manager) catch {};
                 self.running = false;
             },
         }
@@ -664,7 +674,7 @@ pub const Server = struct {
 
     pub fn spawnPaneState(self: *Server, pane_id: pane_mod.PaneId) !void {
         // Use $SHELL if available, otherwise fall back to config default
-        const shell = std.posix.getenv("SHELL") orelse self.config.default_shell;
+        const shell = std.process.Environ.getPosix(self.environ, "SHELL") orelse self.config.default_shell;
         const shell_z = try self.allocator.dupeZ(u8, shell);
         defer self.allocator.free(shell_z);
 
@@ -682,7 +692,7 @@ pub const Server = struct {
         }
         const init_cols: u16 = if (c_cols > reserved_cols) c_cols - reserved_cols else 1;
         const init_rows: u16 = if (c_rows > reserved_rows) c_rows - reserved_rows else 1;
-        const pty = try pty_mod.Pty.spawn(shell_z, init_cols, init_rows);
+        const pty = try pty_mod.Pty.spawn(shell_z, init_cols, init_rows, self.environ);
 
         const sb_lines = self.config.scrollback_lines;
         const sb_bytes = self.config.scrollback_max_bytes;
@@ -709,7 +719,7 @@ pub const Server = struct {
             .data = .{ .u64 = ptyTag(pane_id) },
         };
         const r = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, pty.master_fd, &ev);
-        if (linux.E.init(r) != .SUCCESS) {
+        if (linux.errno(r) != .SUCCESS) {
             _ = self.pane_states.remove(pane_id);
             state.pty.close();
             state.scrollback.deinit(self.allocator);
@@ -1213,18 +1223,20 @@ pub const Server = struct {
         const n = try protocol.encodeFrame(&buf, msg_type, payload);
         var sent: usize = 0;
         while (sent < n) {
-            const w = posix.write(cs.fd, buf[sent..n]) catch |err| {
+            const w_rc = linux.write(cs.fd, buf[sent..n].ptr, n - sent);
+            const w_err = linux.errno(w_rc);
+            if (w_err != .SUCCESS) {
                 // WouldBlock before any data sent = transient backpressure, skip frame
                 // WouldBlock after partial send = protocol stream corrupted, must disconnect
-                if (err == error.WouldBlock and sent == 0) return err;
+                if ((w_err == .AGAIN) and sent == 0) return error.WouldBlock;
                 cs.write_failed = true;
-                return err;
-            };
-            if (w == 0) {
+                return error.WriteFailed;
+            }
+            if (w_rc == 0) {
                 cs.write_failed = true;
                 return error.BrokenPipe;
             }
-            sent += w;
+            sent += w_rc;
         }
     }
 
@@ -1233,7 +1245,7 @@ pub const Server = struct {
     fn disconnectClient(self: *Server, client_id: u16) void {
         const cs = self.clients.get(client_id) orelse return;
         _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, cs.fd, null);
-        posix.close(cs.fd);
+        _ = linux.close(cs.fd);
         cs.deinit();
         _ = self.clients.remove(client_id);
         if (self.active_client) |ac| {
