@@ -479,7 +479,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, subcmd, "--version") or std.mem.eql(u8, subcmd, "-v")) {
-        std.debug.print("zplit v0.1.1\n", .{});
+        std.debug.print("zplit v0.2.0\n", .{});
         return;
     }
 
