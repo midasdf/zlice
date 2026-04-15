@@ -3,8 +3,8 @@
 set -e
 
 DISPLAY_NUM=":42"
-SIZE="720x720"
-ZT_BIN="$HOME/zt/zig-out/bin/zt"
+SIZE="800x600"
+ZT_BIN="$HOME/.local/bin/zt-x11"
 ZPLIT_BIN="$HOME/zplit/zig-out/bin/zplit"
 SCREENSHOT_DIR="$HOME/zplit/docs"
 SCREENSHOT_PATH="$SCREENSHOT_DIR/screenshot.png"
@@ -165,6 +165,13 @@ DISPLAY=$DISPLAY_NUM xsetroot -solid black 2>/dev/null || true
 DISPLAY=$DISPLAY_NUM TERM=xterm-256color ZPLIT=0 "$ZT_BIN" 2>/dev/null &
 ZT_PID=$!
 sleep 3
+
+# Resize zt window to fill Xephyr (no WM in Xephyr, so xdotool handles it)
+ZT_WIN=$(DISPLAY=$DISPLAY_NUM xdotool search --class zt | head -1)
+if [ -n "$ZT_WIN" ]; then
+    DISPLAY=$DISPLAY_NUM xdotool windowmove "$ZT_WIN" 0 0 windowsize "$ZT_WIN" 800 600
+    sleep 1
+fi
 
 # Start zplit
 DISPLAY=$DISPLAY_NUM xdotool type --clearmodifiers --delay 30 "$ZPLIT_BIN"

@@ -770,51 +770,17 @@ pub const Grid = struct {
             }
         }
 
-        // Remove blank rows between scrollback content and new content.
-        // After 'clear' + reflow, blank rows from the old viewport appear
-        // in the visible area between old scrollback and new content.
-        // This runs in a loop because each removal shifts the viewport window,
-        // potentially exposing more blank rows from scrollback.
-        if (new_cursor_row > 0) {
-            var total_removed: usize = 0;
-            while (true) {
-                const vp_start: usize = if (self.rows.items.len > new_rows)
-                    self.rows.items.len - new_rows
-                else
-                    0;
-                // Scan forward from viewport start to find a blank-then-content pattern
-                var blank_start: ?usize = null;
-                var blank_end: usize = 0;
-                var found_gap = false;
-                var scan: usize = vp_start;
-                while (scan < new_cursor_row) : (scan += 1) {
-                    if (self.rows.items[scan].contentLen() == 0) {
-                        if (blank_start == null) blank_start = scan;
-                        blank_end = scan + 1;
-                    } else if (blank_start != null) {
-                        // Content row after blank region — this gap should be removed
-                        found_gap = true;
-                        break;
-                    }
-                }
-                if (!found_gap) break;
-                const bs = blank_start.?;
-                const count = blank_end - bs;
-                // Remove blank rows (reverse to preserve indices)
-                var ri: usize = count;
-                while (ri > 0) {
-                    ri -= 1;
-                    var r = self.rows.orderedRemove(bs + ri);
-                    r.deinit(alloc);
-                }
-                new_cursor_row -= @intCast(count);
-                total_removed += count;
-            }
-            // Backfill blank rows at the bottom to maintain viewport size
-            while (self.rows.items.len < new_rows) {
-                self.rows.append(alloc, Row.init(alloc, new_cols, true) catch break) catch break;
-            }
-        }
+        // NOTE: an earlier version (commit 0245b9e) post-processed the reflowed
+        // rows here to delete any "blank rows between content rows" inside the
+        // viewport, to patch over gaps left by `clear` (ED2) followed by a
+        // pane split. That heuristic cannot distinguish clear-artifacts from
+        // legitimate empty output lines (e.g. `printf '\n'` between sections),
+        // so it silently erased real output whenever the pane got reflowed
+        // (every pane split / focus switch that triggers resize). The root
+        // cause of the original gap is now handled at clear time in
+        // `eraseDisplay` (d1b5b4b: only push content rows to scrollback) and
+        // by scrollback trimming before reflow (fd9a80e), so no post-reflow
+        // blank removal is needed and doing it corrupts user-visible output.
 
         self.cols = new_cols;
         self.viewport_rows = new_rows;

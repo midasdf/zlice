@@ -218,6 +218,9 @@ pub const Server = struct {
     socket_path: []const u8, // owned, for cleanup
     session_name: []const u8, // owned, for session save
     next_pane_id: pane_mod.PaneId, // global pane ID counter (pane 0 is reserved for first tab)
+    /// Debug: if >= 0, mirror every sendFrameTo payload to this fd.
+    /// Enabled by setting env var ZPLIT_TEE_PATH=/path/to/log before starting server.
+    tee_fd: i32 = -1,
 
     /// Allocate a fresh pane ID, skipping any that are still in use.
     fn allocPaneId(self: *Server) ?pane_mod.PaneId {
@@ -311,6 +314,31 @@ pub const Server = struct {
             .next_pane_id = 1, // pane 0 is the initial pane of the first tab
         };
 
+        // Optional debug: mirror every outgoing payload to a file when
+        // ZPLIT_TEE_PATH is set in the environment. Used to capture the raw
+        // ANSI stream sent to clients for off-line analysis.
+        blk: {
+            const prefix = "ZPLIT_TEE_PATH=";
+            const env_slice = environ.block.view().slice;
+            for (env_slice) |entry_ptr| {
+                const entry = std.mem.span(entry_ptr);
+                if (!std.mem.startsWith(u8, entry, prefix)) continue;
+                const path = entry[prefix.len..];
+                if (path.len == 0) break :blk;
+                const pathZ = allocator.dupeZ(u8, path) catch break :blk;
+                defer allocator.free(pathZ);
+                const fd_rc = linux.open(
+                    pathZ.ptr,
+                    .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true },
+                    0o600,
+                );
+                if (linux.errno(fd_rc) == .SUCCESS) {
+                    srv.tee_fd = @intCast(fd_rc);
+                }
+                break;
+            }
+        }
+
         // Spawn PTY for the initial pane (id=0)
         try srv.spawnPaneState(0);
 
@@ -342,6 +370,7 @@ pub const Server = struct {
 
         _ = linux.close(self.listen_fd);
         _ = linux.close(self.epoll_fd);
+        if (self.tee_fd >= 0) _ = linux.close(self.tee_fd);
 
         // Remove socket file
         const socket_pathZ = self.allocator.dupeZ(u8, self.socket_path) catch null;
@@ -1282,7 +1311,20 @@ pub const Server = struct {
 
     // ── sendFrameTo ──────────────────────────────────────────────────────
 
-    fn sendFrameTo(_: *Server, cs: *ClientState, msg_type: protocol.MessageType, payload: []const u8) !void {
+    fn sendFrameTo(self: *Server, cs: *ClientState, msg_type: protocol.MessageType, payload: []const u8) !void {
+        // Debug tee: mirror render payloads (the actual ANSI stream) to a log
+        // file when ZPLIT_TEE_PATH is configured. Skipped for non-render
+        // message types and best-effort on write errors.
+        if (self.tee_fd >= 0 and msg_type == .render and payload.len > 0) {
+            var written: usize = 0;
+            while (written < payload.len) {
+                const rc = linux.write(self.tee_fd, payload[written..].ptr, payload.len - written);
+                if (linux.errno(rc) != .SUCCESS) break;
+                if (rc == 0) break;
+                written += rc;
+            }
+        }
+
         var buf: [protocol.HEADER_SIZE + protocol.MAX_PAYLOAD_LEN]u8 = undefined;
         const n = try protocol.encodeFrame(&buf, msg_type, payload);
         var sent: usize = 0;

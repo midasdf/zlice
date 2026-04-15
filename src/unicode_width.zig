@@ -386,7 +386,14 @@ fn isEmojiOrPictographWide(cp: u21) bool {
     if (cp >= 0x1F300 and cp <= 0x1FAFF) return true; // misc symbols & pictographs, etc.
     if (cp >= 0x1F000 and cp <= 0x1F02F) return true; // mahjong, domino
     if (cp >= 0x1F0A0 and cp <= 0x1F0FF) return true; // playing cards
-    if (cp >= 0x2700 and cp <= 0x27BF) return true; // dingbats (emoji subset)
+    // NOTE: the Dingbats block (0x2700-0x27BF) is intentionally NOT blanket-wide.
+    // Most codepoints in that block are typographic ornaments (e.g. U+276F ❯
+    // Heavy Right-Pointing Angle Quotation Mark, used by default in fish's
+    // prompt) with East Asian Width = Neutral, and terminal clients (including
+    // the accompanying zt terminal) render them as width 1. Marking them wide
+    // here caused pane-border shift after a split because the server stored a
+    // spacer cell while the client drew no such thing, so every cell after
+    // the first `❯` on a row rendered one column to the left.
     if (cp == 0x231A or cp == 0x231B) return true; // watch, hourglass
     if (cp >= 0x23E9 and cp <= 0x23F3) return true; // media / UI symbols
     if (cp >= 0x23F8 and cp <= 0x23FA) return true;
