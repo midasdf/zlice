@@ -420,7 +420,11 @@ pub const Server = struct {
                         const payload = cs.recv_buf[consumed + protocol.HEADER_SIZE .. frame_end];
                         self.handleClientFrame(client_id, hdr.msg_type, payload);
                         consumed = frame_end;
+                        // Guard: handleClientFrame may have disconnected this client
+                        // (e.g. .detach frame), freeing `cs`. Stop draining in that case.
+                        if (self.clients.get(client_id) == null) break;
                     }
+                    if (self.clients.get(client_id) == null) continue;
                     if (consumed > 0 and consumed < cs.recv_len) {
                         std.mem.copyForwards(u8, cs.recv_buf[0..], cs.recv_buf[consumed..cs.recv_len]);
                     }
