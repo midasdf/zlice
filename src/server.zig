@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
+const unicode_width = @import("unicode_width.zig");
 const protocol = @import("protocol.zig");
 const pty_mod = @import("pty.zig");
 const vt_mod = @import("vt.zig");
@@ -80,6 +81,41 @@ const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 const MAX_CLIENTS: u8 = 8;
 const RECV_BUF_SIZE: usize = protocol.HEADER_SIZE + protocol.MAX_PAYLOAD_LEN;
+
+/// Tab bar + optional status bar + pane content vertical layout for one client.
+fn clientLayout(cfg: *const config_mod.Config, cs_rows: u16) struct {
+    tab_bar_rows: u16,
+    status_bar_rows: u16,
+    content_start_row: u16,
+    content_rows: u16,
+    status_bar_screen_row: ?u16,
+} {
+    const tab_bar_rows: u16 = if (cs_rows > 0) 1 else 0;
+    const status_bar_rows: u16 = if (cfg.status_bar and cs_rows > 0) 1 else 0;
+    const reserved = tab_bar_rows + status_bar_rows;
+    const content_rows = cs_rows -| reserved;
+
+    const status_top = std.mem.eql(u8, cfg.status_bar_position, "top");
+    const content_start_row: u16 = if (status_top)
+        tab_bar_rows + status_bar_rows
+    else
+        tab_bar_rows;
+
+    const status_bar_screen_row: ?u16 = if (status_bar_rows == 0)
+        null
+    else if (status_top)
+        tab_bar_rows
+    else
+        cs_rows -| 1;
+
+    return .{
+        .tab_bar_rows = tab_bar_rows,
+        .status_bar_rows = status_bar_rows,
+        .content_start_row = content_start_row,
+        .content_rows = content_rows,
+        .status_bar_screen_row = status_bar_screen_row,
+    };
+}
 
 // ─── PaneState ────────────────────────────────────────────────────────────────
 
@@ -390,7 +426,6 @@ pub const Server = struct {
                     self.sendFrameTo(cs, .hello_ack, &.{}) catch {};
                     // Hide cursor and force full redraw
                     self.sendFrameTo(cs, .render, "\x1b[?25l") catch {};
-
                 } else if (isClientTag(tag)) {
                     const client_id = clientIdFromTag(tag);
                     const cs = self.clients.get(client_id) orelse continue;
@@ -414,7 +449,10 @@ pub const Server = struct {
                     while (cs.recv_len - consumed >= protocol.HEADER_SIZE) {
                         const hdr_slice: *const [protocol.HEADER_SIZE]u8 =
                             cs.recv_buf[consumed..][0..protocol.HEADER_SIZE];
-                        const hdr = protocol.decodeHeader(hdr_slice) catch { consumed += 1; continue; };
+                        const hdr = protocol.decodeHeader(hdr_slice) catch {
+                            consumed += 1;
+                            continue;
+                        };
                         const frame_end = consumed + protocol.HEADER_SIZE + hdr.payload_len;
                         if (cs.recv_len < frame_end) break;
                         const payload = cs.recv_buf[consumed + protocol.HEADER_SIZE .. frame_end];
@@ -429,14 +467,12 @@ pub const Server = struct {
                         std.mem.copyForwards(u8, cs.recv_buf[0..], cs.recv_buf[consumed..cs.recv_len]);
                     }
                     cs.recv_len = if (consumed > cs.recv_len) 0 else cs.recv_len - consumed;
-
                 } else if (tag == TAG_SIGNAL) {
                     // SIGTERM or SIGINT — save layout before exit
                     var ssi: linux.signalfd_siginfo = undefined;
                     _ = posix.read(sig_fd, std.mem.asBytes(&ssi)) catch {};
                     session_mod.saveSession(self.allocator, self.io, self.environ, self.session_name, &self.tab_manager) catch {};
                     self.running = false;
-
                 } else if (isPtyTag(tag)) {
                     // PTY output for a pane
                     const pane_id = paneIdFromTag(tag);
@@ -558,11 +594,13 @@ pub const Server = struct {
             .focus_pane => {
                 if (payload.len < 1) return;
                 const dir = std.enums.fromInt(protocol.Direction, payload[0]) orelse return;
-                const status_bar_rows: u16 = if (self.config.status_bar and cs.rows > 0) 1 else 0;
-                const tab_bar_rows: u16 = if (cs.rows > 0) 1 else 0;
-                const reserved = tab_bar_rows + status_bar_rows;
-                const content_rows = if (cs.rows > reserved) cs.rows - reserved else cs.rows;
-                const total_region = pane_mod.Region{ .row = tab_bar_rows, .col = 0, .rows = content_rows, .cols = cs.cols };
+                const lay = clientLayout(&self.config, cs.rows);
+                const total_region = pane_mod.Region{
+                    .row = lay.content_start_row,
+                    .col = 0,
+                    .rows = lay.content_rows,
+                    .cols = cs.cols,
+                };
                 const regions = active_tab.pane_tree.calculateRegions(total_region) catch return;
                 defer self.allocator.free(regions);
                 if (active_tab.pane_tree.focusDirection(active_pane_id, dir, regions)) |new_id| {
@@ -684,7 +722,6 @@ pub const Server = struct {
 
         // Initial size: use active client dimensions minus reserved UI rows/cols.
         // The grid will be properly resized to the actual pane region on the first compose().
-        const reserved_rows: u16 = 2 + 2; // tab bar + status bar + border top/bottom
         const reserved_cols: u16 = 2; // border left/right
         var c_cols: u16 = DEFAULT_COLS;
         var c_rows: u16 = DEFAULT_ROWS;
@@ -694,6 +731,9 @@ pub const Server = struct {
                 if (ac.rows > 0) c_rows = ac.rows;
             }
         }
+        const tab_r: u16 = if (c_rows > 0) 1 else 0;
+        const status_r: u16 = if (self.config.status_bar and c_rows > 0) 1 else 0;
+        const reserved_rows: u16 = tab_r + status_r + 2; // UI chrome + pane border top/bottom
         const init_cols: u16 = if (c_cols > reserved_cols) c_cols - reserved_cols else 1;
         const init_rows: u16 = if (c_rows > reserved_rows) c_rows - reserved_rows else 1;
         const pty = try pty_mod.Pty.spawn(shell_z, init_cols, init_rows, self.environ);
@@ -864,11 +904,13 @@ pub const Server = struct {
     // ── resizePtysForClient ──────────────────────────────────────────────
 
     fn resizePtysForClient(self: *Server, cs: *ClientState) void {
-        const status_bar_rows: u16 = if (self.config.status_bar and cs.rows > 0) 1 else 0;
-        const tab_bar_rows: u16 = if (cs.rows > 0) 1 else 0;
-        const reserved = tab_bar_rows + status_bar_rows;
-        const content_rows = cs.rows -| reserved;
-        const total_region = pane_mod.Region{ .row = tab_bar_rows, .col = 0, .rows = content_rows, .cols = cs.cols };
+        const lay = clientLayout(&self.config, cs.rows);
+        const total_region = pane_mod.Region{
+            .row = lay.content_start_row,
+            .col = 0,
+            .rows = lay.content_rows,
+            .cols = cs.cols,
+        };
         const active_tab = self.tab_manager.activeTab(cs.active_tab);
         const regions = active_tab.pane_tree.calculateRegions(total_region) catch return;
         defer self.allocator.free(regions);
@@ -893,16 +935,12 @@ pub const Server = struct {
         // Clear back buffer
         cs.screen.clear();
 
-        const status_bar_rows: u16 = if (self.config.status_bar and cs.rows > 0) 1 else 0;
-        const tab_bar_rows: u16 = if (cs.rows > 0) 1 else 0;
-        const reserved_rows = tab_bar_rows + status_bar_rows;
-        const content_rows = cs.rows -| reserved_rows;
-        const content_start_row = tab_bar_rows;
+        const lay = clientLayout(&self.config, cs.rows);
 
         const total_region = pane_mod.Region{
-            .row = content_start_row,
+            .row = lay.content_start_row,
             .col = 0,
-            .rows = content_rows,
+            .rows = lay.content_rows,
             .cols = cs.cols,
         };
 
@@ -918,7 +956,7 @@ pub const Server = struct {
         const tab_names = tab_names_buf[0..tab_names_len];
 
         // Render tab bar in row 0
-        if (tab_bar_rows > 0 and cs.screen.rows > 0) {
+        if (lay.tab_bar_rows > 0 and cs.screen.rows > 0) {
             const tab_bar_start: usize = 0;
             const tab_bar_end = @as(usize, cs.screen.cols);
             if (tab_bar_end <= cs.screen.back.len) {
@@ -987,9 +1025,8 @@ pub const Server = struct {
             }
         }
 
-        // Render status bar
-        if (status_bar_rows > 0 and cs.rows > 0) {
-            const bar_row = cs.rows - 1;
+        // Render status bar (row from config: top = below tab bar, bottom = last row)
+        if (lay.status_bar_screen_row) |bar_row| {
             if (bar_row < cs.screen.rows) {
                 const bar_start = @as(usize, bar_row) * cs.screen.cols;
                 const bar_end = bar_start + cs.screen.cols;
@@ -1178,14 +1215,38 @@ pub const Server = struct {
 
                     // Attributes
                     const a = cell.attr;
-                    if (a.bold) { @memcpy(buf[pos..][0..2], ";1"); pos += 2; }
-                    if (a.dim) { @memcpy(buf[pos..][0..2], ";2"); pos += 2; }
-                    if (a.italic) { @memcpy(buf[pos..][0..2], ";3"); pos += 2; }
-                    if (a.underline) { @memcpy(buf[pos..][0..2], ";4"); pos += 2; }
-                    if (a.blink) { @memcpy(buf[pos..][0..2], ";5"); pos += 2; }
-                    if (a.inverse) { @memcpy(buf[pos..][0..2], ";7"); pos += 2; }
-                    if (a.hidden) { @memcpy(buf[pos..][0..2], ";8"); pos += 2; }
-                    if (a.strikethrough) { @memcpy(buf[pos..][0..2], ";9"); pos += 2; }
+                    if (a.bold) {
+                        @memcpy(buf[pos..][0..2], ";1");
+                        pos += 2;
+                    }
+                    if (a.dim) {
+                        @memcpy(buf[pos..][0..2], ";2");
+                        pos += 2;
+                    }
+                    if (a.italic) {
+                        @memcpy(buf[pos..][0..2], ";3");
+                        pos += 2;
+                    }
+                    if (a.underline) {
+                        @memcpy(buf[pos..][0..2], ";4");
+                        pos += 2;
+                    }
+                    if (a.blink) {
+                        @memcpy(buf[pos..][0..2], ";5");
+                        pos += 2;
+                    }
+                    if (a.inverse) {
+                        @memcpy(buf[pos..][0..2], ";7");
+                        pos += 2;
+                    }
+                    if (a.hidden) {
+                        @memcpy(buf[pos..][0..2], ";8");
+                        pos += 2;
+                    }
+                    if (a.strikethrough) {
+                        @memcpy(buf[pos..][0..2], ";9");
+                        pos += 2;
+                    }
 
                     buf[pos] = 'm';
                     pos += 1;
@@ -1206,12 +1267,11 @@ pub const Server = struct {
                 };
                 pos += utf8_len;
 
-                // Advance tracked cursor by 1. For wide (2-cell) chars, the next
-                // iteration handles the spacer cell (char==0) which advances by 1
-                // more, giving a total advancement of 2. This relies on
-                // composeForClient placing spacer cells correctly.
+                // Advance tracked column by display width so the next CUP is correct
+                // for wide characters (spacer column is skipped in the loop body).
+                const disp_w: u16 = @intCast(unicode_width.terminalDisplayWidth(cell.char));
                 cur_row = row;
-                cur_col = col + 1;
+                cur_col = col + @max(disp_w, 1);
             }
         }
 
@@ -1342,6 +1402,35 @@ pub const Server = struct {
 };
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+test "clientLayout bottom matches tab then content then status row" {
+    var cfg = config_mod.Config{};
+    const lay = clientLayout(&cfg, 24);
+    try std.testing.expectEqual(@as(u16, 1), lay.tab_bar_rows);
+    try std.testing.expectEqual(@as(u16, 1), lay.status_bar_rows);
+    try std.testing.expectEqual(@as(u16, 1), lay.content_start_row);
+    try std.testing.expectEqual(@as(u16, 22), lay.content_rows);
+    try std.testing.expectEqual(@as(u16, 23), lay.status_bar_screen_row.?);
+}
+
+test "clientLayout top places status below tab bar and content below both" {
+    var cfg = config_mod.Config{ .status_bar_position = "top" };
+    const lay = clientLayout(&cfg, 24);
+    try std.testing.expectEqual(@as(u16, 1), lay.tab_bar_rows);
+    try std.testing.expectEqual(@as(u16, 1), lay.status_bar_rows);
+    try std.testing.expectEqual(@as(u16, 1), lay.status_bar_screen_row.?);
+    try std.testing.expectEqual(@as(u16, 2), lay.content_start_row);
+    try std.testing.expectEqual(@as(u16, 22), lay.content_rows);
+}
+
+test "clientLayout disabled status bar frees a row for content" {
+    var cfg = config_mod.Config{ .status_bar = false };
+    const lay = clientLayout(&cfg, 24);
+    try std.testing.expectEqual(@as(u16, 0), lay.status_bar_rows);
+    try std.testing.expectEqual(@as(?u16, null), lay.status_bar_screen_row);
+    try std.testing.expectEqual(@as(u16, 1), lay.content_start_row);
+    try std.testing.expectEqual(@as(u16, 23), lay.content_rows);
+}
 
 test "Server struct compiles" {
     // Ensure the Server type is valid and fields are accessible.
