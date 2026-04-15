@@ -82,7 +82,7 @@ pub const Grid = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, cols: u16, viewport_rows: u16) !Grid {
-        var rows: std.ArrayListUnmanaged(Row) = .{};
+        var rows: std.ArrayListUnmanaged(Row) = .{ .items = &.{}, .capacity = 0 };
         errdefer {
             for (rows.items) |*r| r.deinit(allocator);
             rows.deinit(allocator);
@@ -699,7 +699,7 @@ pub const Grid = struct {
         }
 
         // Collect canonical lines as slices of cells
-        var line_cells_list: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Cell)) = .{};
+        var line_cells_list: std.ArrayListUnmanaged(std.ArrayListUnmanaged(Cell)) = .{ .items = &.{}, .capacity = 0 };
         defer {
             for (line_cells_list.items) |*cl| cl.deinit(alloc);
             line_cells_list.deinit(alloc);
@@ -707,7 +707,7 @@ pub const Grid = struct {
 
         for (self.rows.items, 0..) |r, idx| {
             if (r.is_canonical or idx == 0 or line_cells_list.items.len == 0) {
-                var new_line: std.ArrayListUnmanaged(Cell) = .{};
+                var new_line: std.ArrayListUnmanaged(Cell) = .{ .items = &.{}, .capacity = 0 };
                 const content_len = r.contentLen();
                 try new_line.appendSlice(alloc, r.cells[0..content_len]);
                 try line_cells_list.append(alloc, new_line);
@@ -880,7 +880,7 @@ pub const Grid = struct {
 
     fn resizeSimple(self: *Grid, new_cols: u16, new_rows: u16) !void {
         const alloc = self.allocator;
-        var new_row_list: std.ArrayListUnmanaged(Row) = .{};
+        var new_row_list: std.ArrayListUnmanaged(Row) = .{ .items = &.{}, .capacity = 0 };
         errdefer {
             for (new_row_list.items) |*r| r.deinit(alloc);
             new_row_list.deinit(alloc);

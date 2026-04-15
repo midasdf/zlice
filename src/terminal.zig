@@ -53,7 +53,7 @@ pub fn getSize(fd: posix.fd_t) !TerminalSize {
     var wsz: posix.winsize = undefined;
     const fd_usize: usize = @bitCast(@as(isize, fd));
     const rc = linux.syscall3(.ioctl, fd_usize, linux.T.IOCGWINSZ, @intFromPtr(&wsz));
-    switch (linux.E.init(rc)) {
+    switch (linux.errno(rc)) {
         .SUCCESS => {},
         else => return error.IoctlFailed,
     }
@@ -65,9 +65,8 @@ pub fn getSize(fd: posix.fd_t) !TerminalSize {
 
 test "getSize returns nonzero on TTY" {
     const fd = posix.STDOUT_FILENO;
-    if (!posix.isatty(fd)) {
-        return error.SkipZigTest;
-    }
+    // Skip if not a TTY (tcgetattr fails with ENOTTY on non-tty fds)
+    _ = posix.tcgetattr(fd) catch return error.SkipZigTest;
     const size = try getSize(fd);
     try std.testing.expect(size.cols > 0);
     try std.testing.expect(size.rows > 0);

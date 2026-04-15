@@ -205,7 +205,7 @@ pub const PaneTree = struct {
 
     /// Recursively divide `total` among leaves.  Caller owns returned slice.
     pub fn calculateRegions(self: *PaneTree, total: Region) ![]RegionEntry {
-        var list: std.ArrayList(RegionEntry) = .{};
+        var list: std.ArrayList(RegionEntry) = .empty;
         errdefer list.deinit(self.allocator);
         try collectRegions(self.allocator, self.root, total, &list);
         return list.toOwnedSlice(self.allocator);

@@ -35,22 +35,22 @@ pub const SavedSession = struct {
 
 /// Returns the data directory path `~/.local/share/zplit/`.
 /// Caller owns the returned slice.
-pub fn getDataDir(allocator: std.mem.Allocator) ![]const u8 {
-    const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
+pub fn getDataDir(allocator: std.mem.Allocator, environ: std.process.Environ) ![]const u8 {
+    const home = std.process.Environ.getPosix(environ, "HOME") orelse return error.HomeNotSet;
     return std.fmt.allocPrint(allocator, "{s}/.local/share/zplit", .{home});
 }
 
 /// Build the full path for a session file.
 /// Caller owns the returned slice.
 /// Returns error.InvalidSessionName if name contains path separators or ".."
-fn getSessionPath(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+fn getSessionPath(allocator: std.mem.Allocator, environ: std.process.Environ, name: []const u8) ![]const u8 {
     // Reject path traversal attempts
     if (name.len == 0) return error.InvalidSessionName;
     if (std.mem.indexOf(u8, name, "/") != null) return error.InvalidSessionName;
     if (std.mem.indexOf(u8, name, "\\") != null) return error.InvalidSessionName;
     if (std.mem.indexOf(u8, name, "..") != null) return error.InvalidSessionName;
 
-    const dir = try getDataDir(allocator);
+    const dir = try getDataDir(allocator, environ);
     defer allocator.free(dir);
     return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ dir, name });
 }
@@ -69,57 +69,61 @@ fn countLeaves(node: *const pane_mod.LayoutNode) u8 {
 
 /// Serialise a TabManager to a JSON string.  Caller owns the returned slice.
 fn buildJson(allocator: std.mem.Allocator, tab_manager: *tab_mod.TabManager) ![]u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
-    const writer = buf.writer(allocator);
-    try writer.writeAll("{\"tabs\":[");
+    try buf.appendSlice(allocator, "{\"tabs\":[");
 
     var first = true;
     for (tab_manager.tabs) |slot| {
         const t = slot orelse continue;
-        if (!first) try writer.writeByte(',');
+        if (!first) try buf.append(allocator, ',');
         first = false;
 
-        try writer.writeAll("{\"name\":\"");
+        try buf.appendSlice(allocator, "{\"name\":\"");
         const tab_name = t.getName();
         for (tab_name) |ch| {
             switch (ch) {
-                '"' => try writer.writeAll("\\\""),
-                '\\' => try writer.writeAll("\\\\"),
-                else => try writer.writeByte(ch),
+                '"' => try buf.appendSlice(allocator, "\\\""),
+                '\\' => try buf.appendSlice(allocator, "\\\\"),
+                else => try buf.append(allocator, ch),
             }
         }
         const pc = countLeaves(t.pane_tree.root);
-        try writer.print("\",\"pane_count\":{d}}}", .{pc});
+        const tail = try std.fmt.allocPrint(allocator, "\",\"pane_count\":{d}}}", .{pc});
+        defer allocator.free(tail);
+        try buf.appendSlice(allocator, tail);
     }
 
-    try writer.writeAll("]}");
+    try buf.appendSlice(allocator, "]}");
     return buf.toOwnedSlice(allocator);
 }
 
 // ─── Save ─────────────────────────────────────────────────────────────────────
 
 /// Save a session layout to `~/.local/share/zplit/{name}.json`.
-pub fn saveSession(allocator: std.mem.Allocator, name: []const u8, tab_manager: *tab_mod.TabManager) !void {
-    const data_dir = try getDataDir(allocator);
+pub fn saveSession(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ, name: []const u8, tab_manager: *tab_mod.TabManager) !void {
+    const data_dir = try getDataDir(allocator, environ);
     defer allocator.free(data_dir);
 
     // Create the data directory if it does not exist.
-    std.fs.makeDirAbsolute(data_dir) catch |err| switch (err) {
+    std.Io.Dir.createDirAbsolute(io, data_dir, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
-    const session_path = try getSessionPath(allocator, name);
+    const session_path = try getSessionPath(allocator, environ, name);
     defer allocator.free(session_path);
 
     const json = try buildJson(allocator, tab_manager);
     defer allocator.free(json);
 
-    const file = try std.fs.createFileAbsolute(session_path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(json);
+    const file = try std.Io.Dir.createFileAbsolute(io, session_path, .{ .truncate = true });
+    defer file.close(io);
+    var write_buf: [4096]u8 = undefined;
+    var file_writer = file.writer(io, &write_buf);
+    try file_writer.interface.writeAll(json);
+    try file_writer.interface.flush();
 }
 
 // ─── Load ─────────────────────────────────────────────────────────────────────
@@ -127,17 +131,19 @@ pub fn saveSession(allocator: std.mem.Allocator, name: []const u8, tab_manager: 
 /// Load a session from `~/.local/share/zplit/{name}.json`.
 /// Returns null if the file does not exist.
 /// Caller must call `SavedSession.deinit()` on the returned value.
-pub fn loadSession(allocator: std.mem.Allocator, name: []const u8) !?SavedSession {
-    const session_path = try getSessionPath(allocator, name);
+pub fn loadSession(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ, name: []const u8) !?SavedSession {
+    const session_path = try getSessionPath(allocator, environ, name);
     defer allocator.free(session_path);
 
-    const file = std.fs.openFileAbsolute(session_path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.openFileAbsolute(io, session_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    defer file.close();
+    defer file.close(io);
 
-    const contents = try file.readToEndAlloc(allocator, 1024 * 64);
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &read_buf);
+    const contents = try file_reader.interface.allocRemaining(allocator, .limited(1024 * 64));
     defer allocator.free(contents);
 
     return try parseSession(allocator, contents);
@@ -156,7 +162,7 @@ fn parseSession(allocator: std.mem.Allocator, json: []const u8) !SavedSession {
     const tabs_start_pos = std.mem.indexOf(u8, json, tabs_key) orelse return error.InvalidSessionFile;
     var pos: usize = tabs_start_pos + tabs_key.len;
 
-    var tabs: std.ArrayListUnmanaged(SavedTab) = .{};
+    var tabs: std.ArrayListUnmanaged(SavedTab) = .{ .items = &.{}, .capacity = 0 };
     errdefer {
         for (tabs.items) |t| allocator.free(t.name);
         tabs.deinit(allocator);
@@ -204,7 +210,7 @@ fn parseSession(allocator: std.mem.Allocator, json: []const u8) !SavedSession {
                 // String value with escape support.
                 if (pos >= json.len or json[pos] != '"') return error.InvalidSessionFile;
                 pos += 1;
-                var name_buf: std.ArrayListUnmanaged(u8) = .{};
+                var name_buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 };
                 errdefer name_buf.deinit(allocator);
                 while (pos < json.len and json[pos] != '"') {
                     if (json[pos] == '\\') {
@@ -267,10 +273,10 @@ fn isWhitespace(c: u8) bool {
 // ─── Delete ───────────────────────────────────────────────────────────────────
 
 /// Remove a session file. Silently ignores if the file does not exist.
-pub fn deleteSession(allocator: std.mem.Allocator, name: []const u8) void {
-    const session_path = getSessionPath(allocator, name) catch return;
+pub fn deleteSession(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ, name: []const u8) void {
+    const session_path = getSessionPath(allocator, environ, name) catch return;
     defer allocator.free(session_path);
-    std.fs.deleteFileAbsolute(session_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, session_path) catch {};
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -278,34 +284,38 @@ pub fn deleteSession(allocator: std.mem.Allocator, name: []const u8) void {
 const testing = std.testing;
 
 /// Save using a direct file path (bypasses HOME; for tests only).
-fn saveSessionToPath(allocator: std.mem.Allocator, path: []const u8, tab_manager: *tab_mod.TabManager) !void {
+fn saveSessionToPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8, tab_manager: *tab_mod.TabManager) !void {
     const json = try buildJson(allocator, tab_manager);
     defer allocator.free(json);
-    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(json);
+    const file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+    defer file.close(io);
+    var write_buf: [4096]u8 = undefined;
+    var file_writer = file.writer(io, &write_buf);
+    try file_writer.interface.writeAll(json);
+    try file_writer.interface.flush();
 }
 
 /// Load from a direct file path (bypasses HOME; for tests only).
-fn loadSessionFromPath(allocator: std.mem.Allocator, path: []const u8) !?SavedSession {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+fn loadSessionFromPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !?SavedSession {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    defer file.close();
-    const contents = try file.readToEndAlloc(allocator, 1024 * 64);
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &read_buf);
+    const contents = try file_reader.interface.allocRemaining(allocator, .limited(1024 * 64));
     defer allocator.free(contents);
     return try parseSession(allocator, contents);
 }
 
 test "save and load round-trip" {
     const allocator = testing.allocator;
+    const io = std.testing.io;
 
-    // Use a path in /tmp that we can clean up.
-    const ts = std.time.milliTimestamp();
-    const file_path = try std.fmt.allocPrint(allocator, "/tmp/zplit-test-{d}.json", .{ts});
-    defer allocator.free(file_path);
-    defer std.fs.deleteFileAbsolute(file_path) catch {};
+    // Use a fixed path in /tmp that we can clean up.
+    const file_path = "/tmp/zplit-test-roundtrip.json";
+    defer std.Io.Dir.deleteFileAbsolute(io, file_path) catch {};
 
     // Build a tab manager with 2 tabs.
     var mgr = try tab_mod.TabManager.init(allocator);
@@ -314,9 +324,9 @@ test "save and load round-trip" {
     const tab2_idx = try mgr.createTab(1);
     mgr.activeTab(tab2_idx).setName("logs");
 
-    try saveSessionToPath(allocator, file_path, &mgr);
+    try saveSessionToPath(allocator, io, file_path, &mgr);
 
-    var loaded = (try loadSessionFromPath(allocator, file_path)) orelse return error.ExpectedSession;
+    var loaded = (try loadSessionFromPath(allocator, io, file_path)) orelse return error.ExpectedSession;
     defer loaded.deinit(allocator);
 
     try testing.expectEqual(@as(u8, 2), loaded.tab_count);
@@ -326,28 +336,29 @@ test "save and load round-trip" {
 
 test "load nonexistent returns null" {
     const allocator = testing.allocator;
-    const result = try loadSessionFromPath(allocator, "/tmp/zplit-test-nonexistent-99999.json");
+    const io = std.testing.io;
+    const result = try loadSessionFromPath(allocator, io, "/tmp/zplit-test-nonexistent-99999.json");
     try testing.expectEqual(@as(?SavedSession, null), result);
 }
 
 test "delete removes file" {
     const allocator = testing.allocator;
+    const io = std.testing.io;
 
-    const ts = std.time.milliTimestamp();
-    const file_path = try std.fmt.allocPrint(allocator, "/tmp/zplit-del-test-{d}.json", .{ts});
-    defer allocator.free(file_path);
+    const file_path = "/tmp/zplit-del-test.json";
+    defer allocator.free(@as([]u8, @constCast(file_path[0..0]))); // no-op, just for symmetry
 
     // Create a dummy file.
-    const f = try std.fs.createFileAbsolute(file_path, .{});
-    f.close();
+    const f = try std.Io.Dir.createFileAbsolute(io, file_path, .{});
+    f.close(io);
 
     // Verify it exists.
-    try std.fs.accessAbsolute(file_path, .{});
+    try std.Io.Dir.accessAbsolute(io, file_path, .{});
 
     // Delete it.
-    std.fs.deleteFileAbsolute(file_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, file_path) catch {};
 
     // Should no longer exist.
-    const err = std.fs.accessAbsolute(file_path, .{});
+    const err = std.Io.Dir.accessAbsolute(io, file_path, .{});
     try testing.expectError(error.FileNotFound, err);
 }

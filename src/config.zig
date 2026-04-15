@@ -46,7 +46,7 @@ fn dupeAndTrack(cfg: *Config, allocator: std.mem.Allocator, str_val: []const u8)
 /// All heap-allocated string fields are owned by the Config's internal arena.
 /// Call cfg.deinit() to free all allocated memory at once.
 pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
-    var cfg = Config{ ._allocator = allocator, ._allocs = .{} };
+    var cfg = Config{ ._allocator = allocator, ._allocs = .{ .items = &.{}, .capacity = 0 } };
     errdefer cfg.deinit();
 
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -136,18 +136,20 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Config {
 /// Load config from ~/.config/zplit/config.toml.
 /// Returns defaults if the file does not exist.
 /// All heap-allocated string fields must be freed by the caller.
-pub fn loadFromFile(allocator: std.mem.Allocator) !Config {
-    const home = std.posix.getenv("HOME") orelse return Config{};
+pub fn loadFromFile(allocator: std.mem.Allocator, io: std.Io, environ: std.process.Environ) !Config {
+    const home = std.process.Environ.getPosix(environ, "HOME") orelse return Config{};
     const path = try std.fmt.allocPrint(allocator, "{s}/.config/zplit/config.toml", .{home});
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| {
         if (err == error.FileNotFound) return Config{};
         return err;
     };
-    defer file.close();
+    defer file.close(io);
 
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &read_buf);
+    const content = try file_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
     defer allocator.free(content);
 
     return parse(allocator, content);

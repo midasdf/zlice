@@ -31,18 +31,17 @@ pub const Client = struct {
 /// Create a Unix-domain stream socket and connect it to `socket_path`.
 /// Returns the connected file descriptor on success.
 pub fn connect(socket_path: [:0]const u8) !posix.fd_t {
-    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-    errdefer posix.close(fd);
+    const sock_rc = linux.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    if (linux.errno(sock_rc) != .SUCCESS) return error.SocketFailed;
+    const fd: posix.fd_t = @intCast(sock_rc);
+    errdefer _ = linux.close(fd);
 
     var addr = posix.sockaddr.un{ .path = [_]u8{0} ** 108 };
     if (socket_path.len >= addr.path.len) return error.NameTooLong;
     @memcpy(addr.path[0..socket_path.len], socket_path);
 
-    try posix.connect(
-        fd,
-        @ptrCast(&addr),
-        @sizeOf(posix.sockaddr.un),
-    );
+    const conn_rc = linux.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+    if (linux.errno(conn_rc) != .SUCCESS) return error.ConnectFailed;
     return fd;
 }
 
@@ -58,9 +57,14 @@ pub fn sendFrame(
     const n = try protocol.encodeFrame(&buf, msg_type, payload);
     var sent: usize = 0;
     while (sent < n) {
-        const w = try posix.write(fd, buf[sent..n]);
-        if (w == 0) return error.BrokenPipe;
-        sent += w;
+        const w_rc = linux.write(fd, buf[sent..].ptr, n - sent);
+        switch (linux.errno(w_rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return error.WriteFailed,
+        }
+        if (w_rc == 0) return error.BrokenPipe;
+        sent += w_rc;
     }
 }
 
@@ -74,10 +78,10 @@ pub fn sendFrame(
 /// 4. Use epoll to multiplex stdin, the socket, and SIGWINCH (signalfd).
 /// 5. Dispatch events until the server sends `exit` or a fatal error occurs.
 /// 6. Restore the terminal and close resources on exit.
-pub fn run(socket_path: [:0]const u8) !void {
+pub fn run(socket_path: [:0]const u8, io: std.Io, environ: std.process.Environ) !void {
     // ── Connect ──────────────────────────────────────────────────────────────
     const sock_fd = try connect(socket_path);
-    defer posix.close(sock_fd);
+    defer _ = linux.close(sock_fd);
 
     // ── Raw mode ─────────────────────────────────────────────────────────────
     var raw = try terminal.RawMode.enter(posix.STDIN_FILENO);
@@ -85,15 +89,15 @@ pub fn run(socket_path: [:0]const u8) !void {
 
     // ── Switch to alternate screen and clear ────────────────────────────────
     const stdout_fd = posix.STDOUT_FILENO;
-    _ = posix.write(stdout_fd, "\x1b[?1049h\x1b[2J\x1b[H") catch {};
+    _ = linux.write(stdout_fd, "\x1b[?1049h\x1b[2J\x1b[H", "\x1b[?1049h\x1b[2J\x1b[H".len);
     defer {
         // Restore main screen on exit
-        _ = posix.write(stdout_fd, "\x1b[?1049l") catch {};
+        _ = linux.write(stdout_fd, "\x1b[?1049l", "\x1b[?1049l".len);
     }
 
     // ── Hello ─────────────────────────────────────────────────────────────────
     const term_size = terminal.getSize(posix.STDOUT_FILENO) catch terminal.TerminalSize{ .cols = 80, .rows = 24 };
-    const term_env = std.posix.getenv("TERM") orelse "xterm-256color";
+    const term_env = std.process.Environ.getPosix(environ, "TERM") orelse "xterm-256color";
 
     var hello_payload: [256]u8 = undefined;
     const hello_len = try protocol.encodeHello(&hello_payload, .{
@@ -110,15 +114,15 @@ pub fn run(socket_path: [:0]const u8) !void {
     // Block normal delivery of SIGWINCH so signalfd can consume it.
     _ = linux.sigprocmask(linux.SIG.BLOCK, &sigwinch_mask, null);
     const sig_rc = linux.signalfd(-1, &sigwinch_mask, linux.SFD.CLOEXEC);
-    if (linux.E.init(sig_rc) != .SUCCESS) return error.SignalFdFailed;
+    if (linux.errno(sig_rc) != .SUCCESS) return error.SignalFdFailed;
     const sig_fd: posix.fd_t = @intCast(sig_rc);
-    defer posix.close(sig_fd);
+    defer _ = linux.close(sig_fd);
 
     // ── epoll ─────────────────────────────────────────────────────────────────
     const epfd_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
-    if (linux.E.init(epfd_rc) != .SUCCESS) return error.EpollCreateFailed;
+    if (linux.errno(epfd_rc) != .SUCCESS) return error.EpollCreateFailed;
     const epfd: i32 = @intCast(epfd_rc);
-    defer posix.close(epfd);
+    defer _ = linux.close(epfd);
 
     // Register stdin
     {
@@ -127,7 +131,7 @@ pub fn run(socket_path: [:0]const u8) !void {
             .data = .{ .u64 = FD_STDIN },
         };
         const r = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, posix.STDIN_FILENO, &ev);
-        if (linux.E.init(r) != .SUCCESS) return error.EpollCtlFailed;
+        if (linux.errno(r) != .SUCCESS) return error.EpollCtlFailed;
     }
     // Register socket
     {
@@ -136,7 +140,7 @@ pub fn run(socket_path: [:0]const u8) !void {
             .data = .{ .u64 = FD_SOCKET },
         };
         const r = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, sock_fd, &ev);
-        if (linux.E.init(r) != .SUCCESS) return error.EpollCtlFailed;
+        if (linux.errno(r) != .SUCCESS) return error.EpollCtlFailed;
     }
     // Register signalfd
     {
@@ -145,7 +149,7 @@ pub fn run(socket_path: [:0]const u8) !void {
             .data = .{ .u64 = FD_SIGNAL },
         };
         const r = linux.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, sig_fd, &ev);
-        if (linux.E.init(r) != .SUCCESS) return error.EpollCtlFailed;
+        if (linux.errno(r) != .SUCCESS) return error.EpollCtlFailed;
     }
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -157,13 +161,13 @@ pub fn run(socket_path: [:0]const u8) !void {
     var recv_buf: [RECV_BUF_SIZE]u8 = undefined;
     var recv_len: usize = 0;
 
-    const stdout = std.fs.File.stdout();
+    const stdout = std.Io.File.stdout();
 
     // ── Event loop ────────────────────────────────────────────────────────────
     while (running) {
         var events: [16]linux.epoll_event = undefined;
         const n_events_rc = linux.epoll_wait(epfd, &events, events.len, -1);
-        const n_events = switch (linux.E.init(n_events_rc)) {
+        const n_events = switch (linux.errno(n_events_rc)) {
             .SUCCESS => n_events_rc,
             .INTR => continue, // interrupted by another signal
             else => return error.EpollWaitFailed,
@@ -226,6 +230,7 @@ pub fn run(socket_path: [:0]const u8) !void {
                             hdr.msg_type,
                             payload,
                             stdout,
+                            io,
                         ) catch |err| {
                             std.log.err("zplit-client: handleServerFrame failed: {}, exiting", .{err});
                             running = false;
@@ -393,7 +398,8 @@ fn dispatchAction(
 fn handleServerFrame(
     msg_type: protocol.MessageType,
     payload: []const u8,
-    stdout: std.fs.File,
+    stdout: std.Io.File,
+    io: std.Io,
 ) !bool {
     switch (msg_type) {
         .hello_ack => {
@@ -403,12 +409,7 @@ fn handleServerFrame(
         .render => {
             // Write the render payload directly to stdout — the server has
             // already formatted it as terminal escape sequences.
-            var written: usize = 0;
-            while (written < payload.len) {
-                const n = try stdout.write(payload[written..]);
-                if (n == 0) return error.StdoutClosed;
-                written += n;
-            }
+            try stdout.writeStreamingAll(io, payload);
         },
 
         .state => {
@@ -426,7 +427,7 @@ fn handleServerFrame(
             // Display the error message in the terminal (best effort).
             var err_buf: [256]u8 = undefined;
             const err_msg = std.fmt.bufPrint(&err_buf, "\r\n[zplit error {d}]: {s}\r\n", .{ err_info.code, err_info.msg }) catch &err_buf;
-            _ = posix.write(posix.STDERR_FILENO, err_msg) catch {};
+            _ = linux.write(posix.STDERR_FILENO, err_msg.ptr, err_msg.len);
         },
 
         // Client-bound only; ignore if server mistakenly sends client→server types.
@@ -454,9 +455,9 @@ test "sendFrame encoding via socketpair" {
     // Create a connected socket pair so we can test the full encode+write path.
     var fds: [2]i32 = undefined;
     const rc = linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
-    if (linux.E.init(rc) != .SUCCESS) return error.SocketpairFailed;
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    if (linux.errno(rc) != .SUCCESS) return error.SocketpairFailed;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
 
     const payload = "hello";
     try sendFrame(fds[0], .input, payload);
@@ -478,9 +479,9 @@ test "sendFrame encoding via socketpair" {
 test "sendFrame empty payload" {
     var fds: [2]i32 = undefined;
     const rc = linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
-    if (linux.E.init(rc) != .SUCCESS) return error.SocketpairFailed;
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
+    if (linux.errno(rc) != .SUCCESS) return error.SocketpairFailed;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
 
     try sendFrame(fds[0], .command, &.{});
 
