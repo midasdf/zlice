@@ -595,7 +595,8 @@ pub const Server = struct {
                 _ = active_tab.pane_tree.splitPane(active_pane_id, .horizontal, new_id) catch return;
                 self.spawnPaneState(new_id) catch |err| {
                     _ = active_tab.pane_tree.closePane(new_id);
-                    return err;
+                    std.log.warn("split_horizontal: spawnPaneState failed: {s}", .{@errorName(err)});
+                    return;
                 };
                 cs.active_panes[cs.active_tab] = new_id;
                 self.invalidateAllClients();
@@ -606,7 +607,8 @@ pub const Server = struct {
                 _ = active_tab.pane_tree.splitPane(active_pane_id, .vertical, new_id) catch return;
                 self.spawnPaneState(new_id) catch |err| {
                     _ = active_tab.pane_tree.closePane(new_id);
-                    return err;
+                    std.log.warn("split_vertical: spawnPaneState failed: {s}", .{@errorName(err)});
+                    return;
                 };
                 cs.active_panes[cs.active_tab] = new_id;
                 self.invalidateAllClients();
