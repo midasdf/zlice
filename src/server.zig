@@ -593,7 +593,10 @@ pub const Server = struct {
             .split_horizontal => {
                 const new_id = self.allocPaneId() orelse return;
                 _ = active_tab.pane_tree.splitPane(active_pane_id, .horizontal, new_id) catch return;
-                self.spawnPaneState(new_id) catch return;
+                self.spawnPaneState(new_id) catch |err| {
+                    _ = active_tab.pane_tree.closePane(new_id);
+                    return err;
+                };
                 cs.active_panes[cs.active_tab] = new_id;
                 self.invalidateAllClients();
                 self.composeAll();
@@ -601,7 +604,10 @@ pub const Server = struct {
             .split_vertical => {
                 const new_id = self.allocPaneId() orelse return;
                 _ = active_tab.pane_tree.splitPane(active_pane_id, .vertical, new_id) catch return;
-                self.spawnPaneState(new_id) catch return;
+                self.spawnPaneState(new_id) catch |err| {
+                    _ = active_tab.pane_tree.closePane(new_id);
+                    return err;
+                };
                 cs.active_panes[cs.active_tab] = new_id;
                 self.invalidateAllClients();
                 self.composeAll();

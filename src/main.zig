@@ -125,8 +125,15 @@ fn findNextSessionName(allocator: std.mem.Allocator, io: std.Io, cfg: *const con
             return name;
         }
     }
-    // Fallback (shouldn't reach with 1000 slots).
-    return try std.fmt.allocPrint(allocator, "{d}", .{@as(u32, 0)});
+    // All slots 0–999 occupied — try slot 0 once more with liveness check.
+    const fallback_name = try allocator.dupe(u8, "0");
+    const fallback_path = try getSocketPath(allocator, cfg, fallback_name);
+    defer allocator.free(fallback_path);
+    if (std.Io.Dir.accessAbsolute(io, fallback_path, .{})) {
+        if (isSessionAlive(fallback_path)) return error.NoFreeSessionSlot;
+        _ = linux.unlink(fallback_path);
+    } else |_| {}
+    return fallback_name;
 }
 
 /// Find an existing session to attach to.
